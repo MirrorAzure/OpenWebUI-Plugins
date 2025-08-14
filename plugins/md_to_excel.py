@@ -38,12 +38,12 @@ class Action:
                 message_content = last_assistant_message["content"]
                 tables = self.get_tables_from_text(text=message_content)
                 if not tables:
-                    raise HTTPException(status_code=400, detail="No tables found")
+                    raise HTTPException(status_code=400, detail="Таблицы не найдены")
 
                 bytes_object = self.save_tables_to_bytes(tables)
                 current_time = datetime.now().strftime("%Y-%m-%d-%H-%M-%S")
 
-                unique_name = f"Table_{model_name}_{current_time}.xlsx"
+                unique_name = f"Таблица_{model_name}_{current_time}.xlsx"
 
                 if __event_call__:
                     base64_blob = base64.b64encode(bytes_object.getbuffer()).decode(
@@ -83,7 +83,7 @@ class Action:
                         }
                     )
 
-                return {"message": "Download event triggered"}
+                return {"message": "Загрузка файла инициирована"}
 
             except Exception as e:
                 await __event_emitter__(
@@ -95,9 +95,9 @@ class Action:
                         },
                     }
                 )
-                print(f"Error processing tables: {str(e)}")
+                print(f"Ошибка при обработке таблиц: {str(e)}")
                 raise HTTPException(
-                    status_code=500, detail=f"Error processing tables: {str(e)}"
+                    status_code=500, detail=f"Ошибка при обработке таблиц: {str(e)}"
                 )
 
     def save_tables_to_bytes(self, tables: list[pd.DataFrame]) -> BytesIO:
@@ -106,7 +106,7 @@ class Action:
         # Записываем DataFrame в буфер как Excel файл
         with pd.ExcelWriter(excel_buffer, engine="xlsxwriter") as writer:
             for idx, table in enumerate(tables):
-                table.to_excel(writer, sheet_name=f"table_{idx}", index=False)
+                table.to_excel(writer, sheet_name=f"таблица_{idx}", index=False)
 
         # Важно: переместить указатель в начало буфера
         excel_buffer.seek(0)
@@ -126,12 +126,12 @@ class Action:
         for table_idx, table_match in enumerate(tables):
             table_text = table_match.group(0).strip().splitlines()
             if len(table_text) < 2:  # Пропускаем, если меньше 2 строк
-                print(f"Table {table_idx+1} skipped: too few lines")
+                print(f"Таблица {table_idx+1} пропущена: слишком мало строк")
                 continue
 
             # Проверяем наличие строки заголовков
             if not re.match(header_separator_pattern, table_text[1]):
-                print(f"Table {table_idx+1} skipped: invalid header separator")
+                print(f"Таблица {table_idx+1} пропущена: некорректный заголовок")
                 continue
 
             # Извлекаем заголовки (первая строка)
