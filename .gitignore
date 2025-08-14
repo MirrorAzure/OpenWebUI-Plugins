@@ -1,0 +1,6 @@
+.venv/
+
+*.xlsx
+*.png
+*.bin
+*.ipynb
