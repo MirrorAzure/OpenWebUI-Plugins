@@ -1,0 +1,398 @@
+"""
+title: Document Writter
+description: Пишет документ по пользовательскому запросу. Ключевые слова: статья, документ, приказ, распоряжение, пояснительная записка, акт
+author: Sergei Vyaznikov
+version: 0.2
+requirements: fastapi, tex2docx, aiohttp, pydantic, langchain, langchain-ollama
+"""
+
+import os
+import re
+import aiohttp
+import tempfile
+
+from pydantic import Field, BaseModel
+from typing import Optional, Callable, Awaitable, Any
+from datetime import datetime
+from fastapi import HTTPException
+from langchain_ollama import OllamaLLM
+from langchain.prompts import PromptTemplate
+from tex2docx import LatexToWordConverter
+
+# По умолчанию tex2docx использует pandoc-crossref
+# Отключаем фильтры, чтобы LatexToWordConverter не жаловался
+from tex2docx.constants import PandocOptions
+
+PandocOptions.FILTER_OPTIONS = []
+
+
+def clean_latex_code(text: str) -> str:
+    """Применить форматирование к сообщению
+
+    Убирает теги think и добавляет теги latex
+
+    :param text: Сообщение для форматирования
+    :return: LaTeX-код, заключённый в теги ```latex```
+    """
+    cleaned_text = remove_think_tags(text).strip()
+    formatted_text = add_latex_tags(cleaned_text)
+    return formatted_text
+
+
+def remove_think_tags(text: str) -> str:
+    """Убирает теги think из ответа нейросети
+
+    :param text: Сообщение для форматирования
+    :return: Сообщение без тегов think
+    """
+    cleaned_text = text.replace("</think>", "").replace("<think>", "")
+    return cleaned_text
+
+
+def add_latex_tags(text: str) -> str:
+    """Добавляет теги LaTeX к сообщению, если их нет
+
+    :param text: Сообщение для форматирования
+    :return: Сообщение с markdown-тегами для LaTeX-кода
+    """
+    if "```latex" in text:
+        return text
+    else:
+        return f"```latex\n{text}\n```"
+
+
+def add_markdown_hidden_tags(
+    text: str, summary: str = "Сгенерированный LaTeX-код"
+) -> str:
+    """Добавляет теги Markdown для скрытия кода
+
+    :param text: Сообщение для форматирования
+    :return: Сообщение с markdown-тегами для скрытия кода
+    """
+    # Данное форматирование создаёт выпадающий элемент с заданным текстом
+    markdown_tagged_text = f"""
+<details>
+<summary>{summary}</summary>
+{text}
+</details>
+"""
+    return markdown_tagged_text
+
+
+def get_latex_from_text(text: str) -> str | None:
+    """Парсит сообщение и достаёт из него содержимое тегов ```latex```
+
+    :param text: Сообщение ассистента
+    :return: Чистый LaTeX-код из сообщения, либо None, если LaTeX-теги не обнаружены
+    """
+    # Считаем, что LaTeX всегда заключён в теги ```latex```
+    pattern = re.compile(
+        r"(?:.|\n)*```latex(?P<latex_code>(?:.|\n)+)```(?:.|\n)*", flags=0
+    )
+    match = pattern.search(text)
+    if match:
+        return match.groupdict().get("latex_code")
+    else:
+        return None
+
+
+def convert_latex_to_docx(latex_code: str) -> str:
+    """Конвертирует LaTeX-код в файл .docx
+
+    :param latex_code: Код на LaTeX
+    :return: Путь до сгенерированного .docx-файла
+    """
+    # Библиотека tex2docx работает через утилиту pandoc, поэтому нужно записать LaTeX-код в файл
+    # Создаём временные файлы
+    with tempfile.NamedTemporaryFile(
+        mode="w", delete=False, encoding="utf-8"
+    ) as temp_tex_file:
+        temp_tex_file.write(latex_code)
+        tex_file_path = temp_tex_file.name
+
+    with tempfile.NamedTemporaryFile(
+        mode="w", delete=False, encoding="utf-8"
+    ) as temp_docx_file:
+        docx_file_path = temp_docx_file.name
+
+    config = {
+        "input_texfile": tex_file_path,
+        "output_docxfile": docx_file_path,
+    }
+    converter = LatexToWordConverter(**config)
+    converter.convert()
+
+    # Удаляем LaTeX-файл после конвертации
+    os.remove(tex_file_path)
+
+    return docx_file_path
+
+
+def get_content_type(filename: str) -> str:
+    """Получить MIME-type для
+
+    :param filename: Полное имя файла (на данный момент корректно обрабатывает docx и xlsx)
+    :return: MIME-type для файла (по умолчанию возвращает application/octet-stream)
+    """
+    # TODO: добавить больше MIME-типов
+    content_types = {
+        "docx": "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+        "xlsx": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+    }
+    file_extension = filename.split(".")[-1]
+    mime_type = content_types.get(file_extension, "application/octet-stream")
+    return mime_type
+
+
+async def upload_document_to_server(
+    filename: str, file_path: str, valves: dict
+) -> dict:
+    """Загружает файл на сервер OpenWebUI
+
+    :param filename: Название файла для загрузки
+    :param file_path: Путь до файла
+
+    :return: Статус загрузки файла
+    """
+    headers = {
+        "Authorization": f"Bearer {valves.API_KEY}",
+        "Accept": "application/json",
+    }
+
+    try:
+        # Используется параметр quote_fields, чтобы не экранировать название файла
+        form = aiohttp.FormData(quote_fields=False)
+        mime_type = get_content_type(filename)
+        form.add_field(
+            "file",
+            open(file_path, "rb"),
+            filename=filename,
+            content_type=mime_type,
+        )
+
+        async with aiohttp.ClientSession(
+            timeout=aiohttp.ClientTimeout(total=60)
+        ) as session:
+            async with session.post(
+                "http://127.0.0.1:8080/api/v1/files/",
+                headers=headers,
+                data=form,
+            ) as resp:
+                status = resp.status
+
+                # Сначала проверяем статус
+                if status < 200 or status >= 300:
+                    text = await resp.text()
+                    return {"error": f"HTTP {status}", "raw_response": text}
+
+                # Только при успешном статусе парсим JSON
+                try:
+                    data = await resp.json()
+                except Exception:
+                    text = await resp.text()
+                    return {
+                        "error": "Invalid JSON in response",
+                        "status_code": status,
+                        "raw_response": text,
+                    }
+
+        # Получаем ID файла
+        file_id = data.get("id") or data.get("uuid") or data.get("file_id")
+        if not file_id:
+            return {"error": "No file ID in response", "json": data}
+
+        # Формируем ссылку для загрузки файла
+        download_url = f"{valves.PUBLIC_DOWNLOAD_DOMAIN}/api/v1/files/{file_id}/content"
+        return {"url": download_url}
+
+    except Exception as e:
+        return {"error": f"Upload failed: {e}"}
+
+
+class Tools:
+
+    class Valves(BaseModel):
+
+        OLLAMA_BASE_URL: str = Field(
+            default="http://localhost:11434",
+            description="Домен для доступа к Ollama (указывается изнутри контейнера)",
+        )
+
+        OLLAMA_MODEL_NAME: str = Field(
+            default="qwen3:14b",
+            description="Название модели для генерации документов",
+        )
+
+        PUBLIC_DOWNLOAD_DOMAIN: str = Field(
+            default="http://localhost:3000",
+            description="Домен для доступа к OpenWebUI (без символа `/` в конце)",
+        )
+
+        API_KEY: str = Field(
+            default="sk-6338431ec14445b59f4cb1039f39dc9e",
+            description="API-ключ для OpenWebUI (получается в настройках)",
+        )
+
+        MAX_FILENAME_LEN: int = Field(
+            default=64, description="Задаёт максимальную длину названия для файлов"
+        )
+
+    def __init__(self):
+        self.file_handler = True
+        self.valves = self.Valves()
+
+    async def write_document(
+        self,
+        title: str,
+        __model__=None,
+        __messages__=None,
+        __event_emitter__=None,
+        __event_call__: Optional[Callable[[Any], Awaitable[None]]] = None,
+    ) -> dict:
+        """
+        Инструмент для написания документов (статей, распоряжений, приказов и т.д.)
+
+        Используется для генерации любых документов, требующих форматирования.
+        Инструмент автоматически сгенерирует и отправит пользователю нужный документ и вернёт статус написания.
+
+        :param title: Название документа для генерации.
+        :type title: str.
+
+        :return: Статус написания документа.
+        :rtype: str.
+        """
+
+        await __event_emitter__(
+            {
+                "type": "status",
+                "data": {
+                    "description": "Генерирую LaTeX-документ...",
+                    "done": False,
+                    "hidden": False,
+                },
+            }
+        )
+
+        context = str(list(filter(lambda x: x["role"] == "user", __messages__)))
+
+        # TODO: улучшить промпт для генерации LaTeX-документа
+        # Следует ограничить список LaTeX-пакетов и попытаться пофиксить бесконечную генерацию
+        prompt_template = """/no_think
+            Ты занимаешься написанием документов и статей на LaTeX.
+            Пользователь отправляет тебе название требуемого документа.
+            Тебе необходимо написать документ в формате LaTeX на заданную тему.
+            В своём ответе отправляй только текст в формате LaTeX.
+            Не пиши ничего больше, не пиши никаких объяснений.
+
+            Название документа: {title}
+            Предоставленный контекст:
+            <context>
+            {context}
+            </context>
+            """
+        prompt = PromptTemplate.from_template(prompt_template)
+        prompt = prompt.invoke({"title": title, "context": context})
+
+        llm = OllamaLLM(
+            model=self.valves.OLLAMA_MODEL_NAME, base_url=self.valves.OLLAMA_BASE_URL
+        )
+
+        latex_code = llm.invoke(prompt)
+        formatted_code = clean_latex_code(latex_code)
+        latex_code = get_latex_from_text(formatted_code)
+        markdown_tagged_text = add_markdown_hidden_tags(
+            formatted_code, summary="Сгенерированный LaTeX-код"
+        )
+        await __event_emitter__(
+            {
+                "type": "status",
+                "data": {
+                    "description": "LaTeX-документ сгенерирован!",
+                    "done": True,
+                    "hidden": False,
+                },
+            }
+        )
+
+        await __event_emitter__(
+            {
+                "type": "message",
+                "data": {"content": markdown_tagged_text},
+            }
+        )
+
+        await __event_emitter__(
+            {
+                "type": "status",
+                "data": {
+                    "description": "Конвертирую в .docx...",
+                    "done": False,
+                    "hidden": False,
+                },
+            }
+        )
+
+        docx_file_path = convert_latex_to_docx(latex_code)
+
+        model_name = __model__.get("id")
+        current_time = datetime.now().strftime("%Y-%m-%d-%H-%M-%S")
+        unique_name = f"Document_{model_name}_{current_time}.docx"
+
+        # Обрезаем название файла до заданного максимального
+        # Иначе OpenWebUI может выдавать ошибку 400 на длинных названиях
+        upload_response = await upload_document_to_server(
+            filename=f"{title[:self.valves.MAX_FILENAME_LEN]}.docx",
+            file_path=docx_file_path,
+            valves=self.valves,
+        )
+
+        # Удаляем .docx-файл после загрузки на сервер
+        os.remove(docx_file_path)
+
+        error = upload_response.get("error")
+
+        if error:
+            raw_response = upload_response.get("raw_response")
+            response = f"Во время генерации документа произошла ошибка: {error}. Ваша задача заключается в том, чтобы уведомить пользователя об ошибке."
+            await __event_emitter__(
+                {
+                    "type": "status",
+                    "data": {
+                        "description": f"Ошибка при генерации документа: {raw_response}",
+                        "done": True,
+                        "hidden": False,
+                    },
+                }
+            )
+            return response
+
+        document_url = upload_response.get("url")
+
+        # В идеале использовать html-теги <a> для формирования ссылки, но по какой-то причине их не поддерживает OpenWebUI
+        formatted_url = f"""
+\n\n
+[Скачать документ]({document_url})
+\n\n
+        """
+
+        await __event_emitter__(
+            {
+                "type": "message",
+                "data": {"content": formatted_url},
+            }
+        )
+
+        await __event_emitter__(
+            {
+                "type": "status",
+                "data": {
+                    "description": "Конвертация в .docx завершена!",
+                    "done": True,
+                    "hidden": False,
+                },
+            }
+        )
+        response = "Документ был написан и отправлен пользователю. \
+        Ваша задача заключается в том, чтобы уведомить пользователя о выполнении его запроса. \
+        Сообщите, что скачать его можно по кнопке 'Скачать документ'"
+        return response
