@@ -174,7 +174,7 @@ async def upload_document_to_server(
             timeout=aiohttp.ClientTimeout(total=60)
         ) as session:
             async with session.post(
-                "http://127.0.0.1:8080/api/v1/files/",
+                f"{valves.INTERNAL_URL}/api/v1/files/",
                 headers=headers,
                 data=form,
             ) as resp:
@@ -226,6 +226,11 @@ class Tools:
         PUBLIC_DOWNLOAD_DOMAIN: str = Field(
             default="http://localhost:3000",
             description="Домен для доступа к OpenWebUI (без символа `/` в конце)",
+        )
+
+        INTERNAL_URL: str = Field(
+            default="http://localhost:3000",
+            description="Домен для доступа контейнера к самому себе",
         )
 
         MAX_FILENAME_LEN: int = Field(
