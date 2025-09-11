@@ -2,7 +2,7 @@
 title: Document Writter
 description: Пишет документ по пользовательскому запросу. Ключевые слова: статья, документ, приказ, распоряжение, пояснительная записка, акт
 author: Sergei Vyaznikov
-version: 0.2
+version: 0.3
 requirements: fastapi, tex2docx, aiohttp, pydantic, langchain, langchain-ollama
 """
 
@@ -145,7 +145,7 @@ def get_content_type(filename: str) -> str:
 
 
 async def upload_document_to_server(
-    filename: str, file_path: str, valves: dict
+    filename: str, file_path: str, valves: dict, auth_data: str
 ) -> dict:
     """Загружает файл на сервер OpenWebUI
 
@@ -155,7 +155,7 @@ async def upload_document_to_server(
     :return: Статус загрузки файла
     """
     headers = {
-        "Authorization": f"Bearer {valves.API_KEY}",
+        "Authorization": auth_data,
         "Accept": "application/json",
     }
 
@@ -228,11 +228,6 @@ class Tools:
             description="Домен для доступа к OpenWebUI (без символа `/` в конце)",
         )
 
-        API_KEY: str = Field(
-            default="sk-6338431ec14445b59f4cb1039f39dc9e",
-            description="API-ключ для OpenWebUI (получается в настройках)",
-        )
-
         MAX_FILENAME_LEN: int = Field(
             default=64, description="Задаёт максимальную длину названия для файлов"
         )
@@ -245,6 +240,7 @@ class Tools:
         self,
         title: str,
         __model__=None,
+        __request__=None,
         __messages__=None,
         __event_emitter__=None,
         __event_call__: Optional[Callable[[Any], Awaitable[None]]] = None,
@@ -334,9 +330,13 @@ class Tools:
 
         docx_file_path = convert_latex_to_docx(latex_code)
 
-        model_name = __model__.get("id")
-        current_time = datetime.now().strftime("%Y-%m-%d-%H-%M-%S")
-        unique_name = f"Document_{model_name}_{current_time}.docx"
+        # model_name = __model__.get("id")
+        # current_time = datetime.now().strftime("%Y-%m-%d-%H-%M-%S")
+        # unique_name = f"Document_{model_name}_{current_time}.docx"
+
+        # Получаем данные авторизации из запроса пользователя
+        # Нужно, чтобы пользователь имел доступ к сгенерированному файлу
+        auth_data = __request__.headers["authorization"]
 
         # Обрезаем название файла до заданного максимального
         # Иначе OpenWebUI может выдавать ошибку 400 на длинных названиях
@@ -344,6 +344,7 @@ class Tools:
             filename=f"{title[:self.valves.MAX_FILENAME_LEN]}.docx",
             file_path=docx_file_path,
             valves=self.valves,
+            auth_data=auth_data
         )
 
         # Удаляем .docx-файл после загрузки на сервер
