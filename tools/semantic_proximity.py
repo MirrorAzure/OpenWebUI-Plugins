@@ -2,11 +2,12 @@
 title: Семантическая близость
 description: Сопоставляет две таблицы (excel-файла) и возвращает результат сопоставления. Ключевые слова: сопоставление таблиц, спосоставление excel-файлов
 author: Sergei Vyaznikov
-version: 0.2
+version: 0.3
 requirements: fastapi, aiohttp, pydantic, xlsxwriter, chromadb, pandas, sentence_transformers
 """
 
 import os
+import re
 import math
 import aiohttp
 import difflib
@@ -17,6 +18,7 @@ import pandas as pd
 from io import BytesIO
 from pathlib import Path
 from datetime import datetime
+from fastapi import HTTPException
 from pydantic import BaseModel, Field
 from typing import Optional, Callable, Awaitable, Any, Union, Literal
 
@@ -121,8 +123,8 @@ def get_proximity_df(
     client = chromadb.Client(Settings())
 
     # Проверка существования коллекции и удаление, если существует
-    if collection_name in [coll.name for coll in client.list_collections()]:
-        client.delete_collection(collection_name=collection_name)
+    if collection_name in client.list_collections():
+        client.delete_collection(name=collection_name)
 
     # Создание новой коллекции
     collection = client.create_collection(
@@ -593,7 +595,7 @@ class Tools:
                     },
                 }
             )
-            url_response = upload_document_to_server(
+            url_response = await upload_document_to_server(
                 filename=unique_name,
                 file_path=temp_file_path,
                 valves=self.valves,
