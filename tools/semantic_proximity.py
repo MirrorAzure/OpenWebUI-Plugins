@@ -7,7 +7,6 @@ requirements: fastapi, aiohttp, pydantic, xlsxwriter, chromadb, pandas, sentence
 """
 
 import os
-import re
 import math
 import aiohttp
 import difflib
@@ -18,7 +17,6 @@ import pandas as pd
 from io import BytesIO
 from pathlib import Path
 from datetime import datetime
-from fastapi import HTTPException
 from pydantic import BaseModel, Field
 from typing import Optional, Callable, Awaitable, Any, Union, Literal
 
@@ -75,7 +73,7 @@ def get_embedding_model() -> SentenceTransformer:
         "RAG_EMBEDDING_MODEL", "sentence-transformers/all-MiniLM-L6-v2"
     )
     embedder = SentenceTransformer(embedding_model_name)
-    embedder.to(device_name)
+    # embedder.to(device_name)
     return embedder
 
 
@@ -116,7 +114,7 @@ def get_proximity_df(
     # Создаём векторы для наименований второго файла
     second_names_list = second_df[second_column].tolist()
     second_vectors = embedder_model.encode(
-        second_names_list, device=device_name, show_progress_bar=True
+        second_names_list  # , device=device_name, show_progress_bar=True
     )
 
     # Инициируем коллекцию ChromaDB в оперативной памяти
@@ -129,9 +127,7 @@ def get_proximity_df(
     # Создание новой коллекции
     collection = client.create_collection(
         name=collection_name,
-        metadata={
-            "hnsw:space": valves.get("DISTANCE_METRIC")
-        },  # Указываем метрику расстояния
+        metadata={"hnsw:space": valves.DISTANCE_METRIC},  # Указываем метрику расстояния
     )
 
     # У ChromaDB есть ограничение на количество одновременно добавляемых точек
@@ -159,7 +155,7 @@ def get_proximity_df(
     # Создаём векторы для наименований первого файла
     first_names_list = first_df[first_column].tolist()
     first_vectors = embedder_model.encode(
-        first_names_list, device=device_name, show_progress_bar=True
+        first_names_list  # , device=device_name, show_progress_bar=True
     )
 
     # Сохраняем индекс ближайшего совпадения для каждой строки в первом файле
@@ -361,7 +357,7 @@ def get_user_auth_data(request) -> str:
 
     :param request: Объект __request__ из OpenWebUI
     """
-    auth_data = request.auth
+    auth_data = request.headers.get("Authorization")
     return auth_data
 
 
@@ -395,7 +391,7 @@ async def upload_document_to_server(
             timeout=aiohttp.ClientTimeout(total=60)
         ) as session:
             async with session.post(
-                f"{valves.get('INTERNAL_URL')}/api/v1/files/",
+                f"{valves.INTERNAL_URL}/api/v1/files/",
                 headers=headers,
                 data=form,
             ) as resp:
