@@ -118,9 +118,9 @@ async def get_file_content(auth_data: str, file_id: str, valves: dict) -> BytesI
     return file_content
 
 
-def get_faster_whisper_model() -> WhisperModel:
+def get_faster_whisper_model(valves: dict) -> WhisperModel:
     whisper_model_index = os.environ.get("WHISPER_MODEL", "base")
-    device_name = "cuda" if torch.cuda.is_available() else "cpu"
+    device_name = valves.DEVICE
     faster_whisper_model = WhisperModel(
         whisper_model_index,
         download_root="/app/backend/data/cache/whisper/models",
@@ -219,8 +219,7 @@ class Tools:
             "pyannote/speaker-diarization-3.1",
             # use_auth_token=hf_token
         )
-        if torch.cuda.is_available():
-            pyannote_pipeline.to(torch.device("cuda"))
+        pyannote_pipeline.to(self.valves.DEVICE)
 
         await __event_emitter__(
             {
@@ -254,7 +253,7 @@ class Tools:
         )
 
         # whisper_pipeline = get_whisper_model()
-        faster_whisper_model = get_faster_whisper_model()
+        faster_whisper_model = get_faster_whisper_model(valves=self.valves)
 
         await __event_emitter__(
             {
