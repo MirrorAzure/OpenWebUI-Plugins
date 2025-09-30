@@ -2,8 +2,8 @@
 title: Audio Transcriber
 author: Sergei Vyaznikov
 description: Переводит аудиофайл в текст с разбиением на спикеров. Ключевые слова: транскрибация, распознавание речи, аудиофайлы
-version: 0.0.1
-requirements: pyannote.audio, torch, torchvision, torchaudio, transformers, faster_whisper
+version: 0.2
+requirements: pyannote.audio==3.4.0, torch, torchvision, torchaudio, transformers, faster_whisper
 """
 
 import os
@@ -120,8 +120,11 @@ async def get_file_content(auth_data: str, file_id: str, valves: dict) -> BytesI
 
 def get_faster_whisper_model() -> WhisperModel:
     whisper_model_index = os.environ.get("WHISPER_MODEL", "base")
+    device_name = "cuda" if torch.cuda.is_available() else "cpu"
     faster_whisper_model = WhisperModel(
-        whisper_model_index, download_root="/app/backend/data/cache/whisper/models"
+        whisper_model_index,
+        download_root="/app/backend/data/cache/whisper/models",
+        device=device_name,
     )
     return faster_whisper_model
 
@@ -204,6 +207,8 @@ class Tools:
             "pyannote/speaker-diarization-3.1",
             # use_auth_token=hf_token
         )
+        if torch.cuda.is_available():
+            pyannote_pipeline.to(torch.device("cuda"))
 
         await __event_emitter__(
             {
