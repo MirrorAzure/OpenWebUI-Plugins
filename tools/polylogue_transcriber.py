@@ -12,7 +12,7 @@ import torch
 import torchaudio
 from io import BytesIO
 from typing import Any, Literal, List, Tuple
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 from pyannote.core import Segment, Annotation
 
 from pyannote.audio import Pipeline as PyannotePipeline
@@ -148,6 +148,18 @@ class Tools:
             # default="/app/backend/data/cache/embedding/models",
             description="Директория со снапшотами моделей pyannote",
         )
+        DEVICE: Literal["cuda", "cpu"] = Field(
+            default="cuda" if torch.cuda.is_available() else "cpu",
+            description="Устройство для инференса моделей",
+        )
+
+        @field_validator("DEVICE")
+        @classmethod
+        def restrict_device(cls, value: str) -> str:
+            allowed_devices = ["cuda", "cpu"] if torch.cuda.is_available() else ["cpu"]
+            if value not in allowed_devices:
+                raise ValueError(f"Доступные устройства: {allowed_devices}")
+            return value
 
     def __init__(self):
         self.valves = self.Valves()
