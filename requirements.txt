@@ -1,0 +1,17 @@
+fastapi
+tex2docx
+aiohttp
+pydantic
+langchain
+langchain-ollama
+ocrmypdf
+xlsxwriter
+chromadb
+pandas
+sentence_transformers
+pyannote.audio==3.4.0
+torch
+torchvision
+torchaudio
+transformers
+faster_whisper
