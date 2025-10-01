@@ -2,7 +2,7 @@
 title: Document Writter
 description: Пишет документ по пользовательскому запросу. Ключевые слова: статья, документ, приказ, распоряжение, пояснительная записка, акт
 author: Sergei Vyaznikov
-version: 0.3
+version: 0.4
 requirements: fastapi, tex2docx, aiohttp, pydantic, langchain, langchain-ollama
 """
 
@@ -241,6 +241,17 @@ class Tools:
         self.file_handler = True
         self.valves = self.Valves()
 
+
+    async def write_table(self) -> str:
+        """
+        Инструмент для составления таблиц
+
+        :return: Дальнейшие инструкции
+        :rtype: str
+        """
+        response = "Ваша задача заключается в том, чтобы составить таблицу в формате markdown и отправить её пользователю."
+        return response
+
     async def write_document(
         self,
         title: str,
@@ -278,19 +289,44 @@ class Tools:
 
         # TODO: улучшить промпт для генерации LaTeX-документа
         # Следует ограничить список LaTeX-пакетов и попытаться пофиксить бесконечную генерацию
-        prompt_template = """/no_think
-            Ты занимаешься написанием документов и статей на LaTeX.
-            Пользователь отправляет тебе название требуемого документа.
-            Тебе необходимо написать документ в формате LaTeX на заданную тему.
-            В своём ответе отправляй только текст в формате LaTeX.
-            Не пиши ничего больше, не пиши никаких объяснений.
 
-            Название документа: {title}
-            Предоставленный контекст:
-            <context>
-            {context}
-            </context>
+        prompt_template = """/no_think
+Ты — технический писатель. Твоя задача — составлять документы и статьи на основе запроса пользователя.
+
+Правила формирования ответа:
+1.  Твой ответ — это ИСКЛЮЧИТЕЛЬНО валидный LaTeX-код, ничего более.
+2.  Для листингов кода используй пакет minted.
+3.  Для научных статей оформляй документ согласно стандартным требованиям (шрифт, отступы, интервалы). В конце таких статей обязательно добавляй раздел "Список литературы", используя команды \\bibliography и \\bibliographystyle.
+
+ЖЕСТКАЯ ИНСТРУКЦИЯ ПО ШАБЛОНУ:
+Начинай документ СТРОГО следующей преамбулой (НИЧЕГО НЕ МЕНЯЯ и НИЧЕГО НЕ ДОБАВЛЯЯ в нее). Этих пакетов ДОСТАТОЧНО:
+
+\\documentclass[a4paper,14pt]{{extarticle}}
+\\usepackage[utf8]{{inputenc}}
+\\usepackage[T2A]{{fontenc}}
+\\usepackage[russian]{{babel}}
+\\usepackage{{graphicx}}
+\\usepackage[margin=2cm]{{geometry}}
+\\usepackage{{parskip}}
+\\usepackage{{indentfirst}}
+\\usepackage{{minted}}
+\\usepackage{{color}}
+\\usepackage[numbers]{{natbib}}
+
+\\definecolor{{codebackground}}{{rgb}}{{0.95,0.95,0.95}}
+
+\\begin{{document}}
+
+После преамбулы НЕМЕДЛЕННО переходи к генерации запрошенного пользователем содержимого. Закончи документ командой \\end{{document}}
+
+Название документа: {title}
+
+Предоставленный контекст:
+<context>
+{context}
+</context>
             """
+        
         prompt = PromptTemplate.from_template(prompt_template)
         prompt = prompt.invoke({"title": title, "context": context})
 
