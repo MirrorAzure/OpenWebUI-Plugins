@@ -2,7 +2,7 @@
 title: Document Writter
 description: Пишет документ по пользовательскому запросу. Ключевые слова: статья, документ, приказ, распоряжение, пояснительная записка, акт
 author: Sergei Vyaznikov
-version: 0.4
+version: 0.5
 requirements: fastapi, tex2docx, aiohttp, pydantic, langchain, langchain-ollama
 """
 
@@ -24,76 +24,6 @@ from tex2docx import LatexToWordConverter
 from tex2docx.constants import PandocOptions
 
 PandocOptions.FILTER_OPTIONS = []
-
-
-def clean_latex_code(text: str) -> str:
-    """Применить форматирование к сообщению
-
-    Убирает теги think и добавляет теги latex
-
-    :param text: Сообщение для форматирования
-    :return: LaTeX-код, заключённый в теги ```latex```
-    """
-    cleaned_text = remove_think_tags(text).strip()
-    formatted_text = add_latex_tags(cleaned_text)
-    return formatted_text
-
-
-def remove_think_tags(text: str) -> str:
-    """Убирает теги think из ответа нейросети
-
-    :param text: Сообщение для форматирования
-    :return: Сообщение без тегов think
-    """
-    cleaned_text = text.replace("</think>", "").replace("<think>", "")
-    return cleaned_text
-
-
-def add_latex_tags(text: str) -> str:
-    """Добавляет теги LaTeX к сообщению, если их нет
-
-    :param text: Сообщение для форматирования
-    :return: Сообщение с markdown-тегами для LaTeX-кода
-    """
-    if "```latex" in text:
-        return text
-    else:
-        return f"```latex\n{text}\n```"
-
-
-def add_markdown_hidden_tags(
-    text: str, summary: str = "Сгенерированный LaTeX-код"
-) -> str:
-    """Добавляет теги Markdown для скрытия кода
-
-    :param text: Сообщение для форматирования
-    :return: Сообщение с markdown-тегами для скрытия кода
-    """
-    # Данное форматирование создаёт выпадающий элемент с заданным текстом
-    markdown_tagged_text = f"""
-<details>
-<summary>{summary}</summary>
-{text}
-</details>
-"""
-    return markdown_tagged_text
-
-
-def get_latex_from_text(text: str) -> str | None:
-    """Парсит сообщение и достаёт из него содержимое тегов ```latex```
-
-    :param text: Сообщение ассистента
-    :return: Чистый LaTeX-код из сообщения, либо None, если LaTeX-теги не обнаружены
-    """
-    # Считаем, что LaTeX всегда заключён в теги ```latex```
-    pattern = re.compile(
-        r"(?:.|\n)*```latex(?P<latex_code>(?:.|\n)+)```(?:.|\n)*", flags=0
-    )
-    match = pattern.search(text)
-    if match:
-        return match.groupdict().get("latex_code")
-    else:
-        return None
 
 
 def convert_latex_to_docx(latex_code: str) -> str:
@@ -241,7 +171,6 @@ class Tools:
         self.file_handler = True
         self.valves = self.Valves()
 
-
     async def write_table(self) -> str:
         """
         Инструмент для составления таблиц
@@ -278,7 +207,7 @@ class Tools:
             {
                 "type": "status",
                 "data": {
-                    "description": "Генерирую LaTeX-документ...",
+                    "description": "Генерирую документ...",
                     "done": False,
                     "hidden": False,
                 },
@@ -286,9 +215,6 @@ class Tools:
         )
 
         context = str(list(filter(lambda x: x["role"] == "user", __messages__)))
-
-        # TODO: улучшить промпт для генерации LaTeX-документа
-        # Следует ограничить список LaTeX-пакетов и попытаться пофиксить бесконечную генерацию
 
         prompt_template = """/no_think
 Ты — технический писатель. Твоя задача — составлять документы и статьи на основе запроса пользователя.
@@ -326,7 +252,7 @@ class Tools:
 {context}
 </context>
             """
-        
+
         prompt = PromptTemplate.from_template(prompt_template)
         prompt = prompt.invoke({"title": title, "context": context})
 
@@ -334,17 +260,64 @@ class Tools:
             model=self.valves.OLLAMA_MODEL_NAME, base_url=self.valves.OLLAMA_BASE_URL
         )
 
-        latex_code = llm.invoke(prompt)
-        formatted_code = clean_latex_code(latex_code)
-        latex_code = get_latex_from_text(formatted_code)
-        markdown_tagged_text = add_markdown_hidden_tags(
-            formatted_code, summary="Сгенерированный LaTeX-код"
+        await __event_emitter__(
+            {
+                "type": "message",
+                "data": {
+                    "content": "<details>\n<summary>Исходный код документа</summary>\n```latex\n"
+                },
+            }
         )
+
+        chunks = []
+        is_thinking = False
+        batch = []
+        batch_size = 20
+
+        for chunk in llm.stream(prompt):
+            if chunk == "<think>":
+                is_thinking = True
+
+            if chunk == "</think>":
+                is_thinking = False
+                continue
+
+            if is_thinking:
+                continue
+
+            batch.append(chunk)
+            chunks.append(chunk)
+            if len(batch) == batch_size:
+                await __event_emitter__(
+                    {
+                        "type": "message",
+                        "data": {"content": "".join(batch).strip()},
+                    }
+                )
+                batch = []
+
+        if batch:
+            await __event_emitter__(
+                {
+                    "type": "message",
+                    "data": {"content": "".join(batch).strip()},
+                }
+            )
+
+        latex_code = "".join(chunks).strip()
+
+        await __event_emitter__(
+            {
+                "type": "message",
+                "data": {"content": "\n```\n</details>"},
+            }
+        )
+
         await __event_emitter__(
             {
                 "type": "status",
                 "data": {
-                    "description": "LaTeX-документ сгенерирован!",
+                    "description": "Документ сгенерирован!",
                     "done": True,
                     "hidden": False,
                 },
@@ -353,16 +326,9 @@ class Tools:
 
         await __event_emitter__(
             {
-                "type": "message",
-                "data": {"content": markdown_tagged_text},
-            }
-        )
-
-        await __event_emitter__(
-            {
                 "type": "status",
                 "data": {
-                    "description": "Конвертирую в .docx...",
+                    "description": "Отправляю документ пользователю...",
                     "done": False,
                     "hidden": False,
                 },
@@ -385,7 +351,7 @@ class Tools:
             filename=f"{title[:self.valves.MAX_FILENAME_LEN]}.docx",
             file_path=docx_file_path,
             valves=self.valves,
-            auth_data=auth_data
+            auth_data=auth_data,
         )
 
         # Удаляем .docx-файл после загрузки на сервер
@@ -428,7 +394,7 @@ class Tools:
             {
                 "type": "status",
                 "data": {
-                    "description": "Конвертация в .docx завершена!",
+                    "description": "Документ отправлен!",
                     "done": True,
                     "hidden": False,
                 },
