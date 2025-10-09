@@ -2,12 +2,11 @@
 title: Семантическая близость
 description: Сопоставляет две таблицы (excel-файла) и возвращает результат сопоставления. Ключевые слова: сопоставление таблиц, спосоставление excel-файлов
 author: Sergei Vyaznikov
-version: 0.3
+version: 0.4
 requirements: fastapi, aiohttp, pydantic, xlsxwriter, chromadb, pandas, sentence_transformers
 """
 
 import os
-import re
 import math
 import aiohttp
 import difflib
@@ -123,7 +122,7 @@ def get_proximity_df(
     client = chromadb.Client(Settings())
 
     # Проверка существования коллекции и удаление, если существует
-    if collection_name in client.list_collections():
+    if collection_name in [coll.name for coll in client.list_collections()]:
         client.delete_collection(name=collection_name)
 
     # Создание новой коллекции
@@ -173,7 +172,9 @@ def get_proximity_df(
     # Формируем новый датафрейм из двух
     merged_df = first_df.copy()
     merged_df["second_df_index"] = similar_indices
-    merged_df = merged_df.join(second_df, on="second_df_index")
+    merged_df = merged_df.join(
+        second_df, on="second_df_index", lsuffix="_x", rsuffix="_y"
+    )
     merged_df["Семантическая близость"] = similarities
 
     # Сортируем по семантической близости
