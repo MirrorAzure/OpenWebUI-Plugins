@@ -2,8 +2,7 @@
 title: PDF text recognizer
 author: Sergei Vyaznikov
 description: Распознаёт текст из PDF и возвращает документ с размеченным текстом. Ключевые слова: OCR, распознавание PDF, сканы документов
-version: 0.1
-required_open_webui_version: 0.6.32
+version: 0.2
 requirements: ocrmypdf
 """
 
@@ -167,7 +166,9 @@ class Tools:
         with tempfile.NamedTemporaryFile(
             prefix=unizue_name, suffix=".pdf", delete=False
         ) as temp_file:
-            ocrmypdf.ocr(file_bytes, temp_file.name, force_ocr=True)
+            ocrmypdf.ocr(
+                file_bytes, temp_file.name, language=["rus", "eng"], force_ocr=True
+            )
             upload_response = await upload_document_to_server(
                 filename=f"{unizue_name}.pdf",
                 file_path=temp_file.name,

@@ -15,3 +15,4 @@ torchvision
 torchaudio
 transformers
 faster_whisper
+plotly
