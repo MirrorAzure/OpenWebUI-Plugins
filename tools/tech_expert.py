@@ -2,12 +2,13 @@
 title: Data Analyst
 description: Получает данные из системы ТехЭксперт. Ключевые слова: ТехЭксперт
 author: Sergei Vyaznikov
-version: 0.1
+version: 0.2
 """
 
 import os
 import uuid
 import math
+import json
 import torch
 import aiohttp
 
@@ -16,14 +17,33 @@ from chromadb.utils import embedding_functions
 from chromadb.config import Settings
 
 from fastapi import HTTPException
-from typing import Any, Literal, List, Tuple
+from typing import Any, Literal, List, Tuple, Callable
 from pydantic import BaseModel, Field, field_validator
+from pydantic.types import conint
 
 from sentence_transformers import SentenceTransformer
 from nltk.tokenize import sent_tokenize
 
 CHROMA_DB_MAX_BATCH_SIZE = 5461
 collection_name = "tech-expert-documents"
+
+
+class EventEmitter:
+    def __init__(self, event_emitter: Callable[[dict], Any] = None):
+        self.event_emitter = event_emitter
+
+    async def emit(self, description="Unknown State", status="in_progress", done=False):
+        if self.event_emitter:
+            await self.event_emitter(
+                {
+                    "type": "status",
+                    "data": {
+                        "status": status,
+                        "description": description,
+                        "done": done,
+                    },
+                }
+            )
 
 
 def get_embedding_model(valves: dict) -> SentenceTransformer:
@@ -74,7 +94,7 @@ async def retrieve_techexpert_document(valves: dict, nd: int, format: str = "mar
                 )
 
 
-def chunk_text(text: str, max_chunk_size: int = 500):
+def chunk_text(text: str, max_chunk_size: int = 1000):
     sentences = sent_tokenize(text)
     chunks = []
     current_chunk = []
@@ -141,6 +161,16 @@ class Tools:
 
     class Valves(BaseModel):
 
+        MAX_DOCS: int = Field(
+            default=10, description="Количество документов для поиска"
+        )
+
+        CHUNK_SIZE: conint(ge=100, le=2000) = Field(
+            json_schema_extra={"format": "range", "minimum": 100, "maximum": 2000},
+            default=1000,
+            description="Размер чанков для выбора семантически близких документов",
+        )
+
         TECH_EXPERT_URL: str = Field(
             default="http://mcp_techexpert:8000",
             description="Домен для доступа к API ТехЭксперта",
@@ -179,7 +209,10 @@ class Tools:
         __event_emitter__=None,
     ) -> str:
         """
-        Инструмент для получения документов из системы ТехЭксперт
+        Инструмент для получения документов из системы ТехЭксперт.
+
+        Инструмент возвращает список релевантных документов, вместе с ссылками на них.
+        
 
         :param queries: Запрос для поиска документов в системе
         :type queries: list[str]
@@ -187,16 +220,18 @@ class Tools:
         :return: Данные из системы ТехЭксперт со ссылками на документы
         :rtype: str
         """
+        emitter = EventEmitter(__event_emitter__)
+
+        await emitter.emit("Получение документов из системы ТехЭксперт...")
 
         user_query = list(
             filter(lambda message: message.get("role") == "user", __messages__)
         )[-1].get("content")
-        queries = ["Искусственный интеллект"]
         processed_nd = set()
         chunk_data = []
         for query in queries:
             response = await search_techexpert_documents(
-                valves=self.valves, query=query
+                valves=self.valves, query=query, max_docs=self.valves.MAX_DOCS
             )
             documents = response.get("documents")
             for document in documents:
@@ -212,7 +247,9 @@ class Tools:
 
                 if not document_text:
                     continue
-                chunks = chunk_text(document_text)
+                chunks = chunk_text(
+                    document_text, max_chunk_size=self.valves.CHUNK_SIZE
+                )
                 for chunk in chunks:
                     chunk_data.append(
                         {
@@ -246,13 +283,30 @@ class Tools:
         ):
             document_name = metadata.get("document_name")
             link = metadata.get("link")
-            response_element = f"""
-            Название документа: {document_name}
-            Ссылка на документ: {link}
-            Точность совпадения: {distance:0.2f}
-            Текст фрагмента:
-            {document}
-            """
+
+            await __event_emitter__(
+                {
+                    "type": "citation",
+                    "data": {
+                        "document": [document],
+                        "metadata": [{"source": link}],
+                        "source": {"name": document_name},
+                    },
+                }
+            )
+
+            response_element = {
+                "document_link": link,
+                "document_name": document_name,
+                "distance": distance,
+                # "content": document,
+            }
             tool_response.append(response_element)
 
-        return "\n\n".join(tool_response)
+        await emitter.emit(
+            status="complete",
+            description="Данные из системы ТехЭксперт были получены!",
+            done=True,
+        )
+
+        return json.dumps(tool_response, ensure_ascii=False)
