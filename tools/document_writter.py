@@ -2,8 +2,7 @@
 title: Document Writter
 description: Пишет документ по пользовательскому запросу. Ключевые слова: статья, документ, приказ, распоряжение, пояснительная записка, акт
 author: Sergei Vyaznikov
-version: 0.5
-requirements: fastapi, tex2docx, aiohttp, pydantic, langchain, langchain-ollama
+version: 0.7
 """
 
 import os
@@ -17,13 +16,7 @@ from datetime import datetime
 from fastapi import HTTPException
 from langchain_ollama import OllamaLLM
 from langchain.prompts import PromptTemplate
-from tex2docx import LatexToWordConverter
-
-# По умолчанию tex2docx использует pandoc-crossref
-# Отключаем фильтры, чтобы LatexToWordConverter не жаловался
-from tex2docx.constants import PandocOptions
-
-PandocOptions.FILTER_OPTIONS = []
+import subprocess
 
 
 def convert_latex_to_docx(latex_code: str) -> str:
@@ -32,7 +25,6 @@ def convert_latex_to_docx(latex_code: str) -> str:
     :param latex_code: Код на LaTeX
     :return: Путь до сгенерированного .docx-файла
     """
-    # Библиотека tex2docx работает через утилиту pandoc, поэтому нужно записать LaTeX-код в файл
     # Создаём временные файлы
     with tempfile.NamedTemporaryFile(
         mode="w", delete=False, encoding="utf-8"
@@ -45,12 +37,11 @@ def convert_latex_to_docx(latex_code: str) -> str:
     ) as temp_docx_file:
         docx_file_path = temp_docx_file.name
 
-    config = {
-        "input_texfile": tex_file_path,
-        "output_docxfile": docx_file_path,
-    }
-    converter = LatexToWordConverter(**config)
-    converter.convert()
+    # Вызов команды pandoc через subprocess
+    subprocess.run(
+        ["pandoc", tex_file_path, "-f", "latex", "-t", "docx", "-o", docx_file_path],
+        check=True,
+    )  # check=True вызовет исключение, если команда завершится с ошибкой
 
     # Удаляем LaTeX-файл после конвертации
     os.remove(tex_file_path)
@@ -222,7 +213,8 @@ class Tools:
 Правила формирования ответа:
 1.  Твой ответ — это ИСКЛЮЧИТЕЛЬНО валидный LaTeX-код, ничего более.
 2.  Для листингов кода используй пакет minted.
-3.  Для научных статей оформляй документ согласно стандартным требованиям (шрифт, отступы, интервалы). В конце таких статей обязательно добавляй раздел "Список литературы", используя команды \\bibliography и \\bibliographystyle.
+3.  Для таблиц используй \\begin{{tabular}}.
+4.  Для научных статей оформляй документ согласно стандартным требованиям (шрифт, отступы, интервалы). В конце таких статей обязательно добавляй раздел "Список литературы", используя команды \\bibliography и \\bibliographystyle.
 
 ЖЕСТКАЯ ИНСТРУКЦИЯ ПО ШАБЛОНУ:
 Начинай документ СТРОГО следующей преамбулой (НИЧЕГО НЕ МЕНЯЯ и НИЧЕГО НЕ ДОБАВЛЯЯ в нее). Этих пакетов ДОСТАТОЧНО:
@@ -306,6 +298,13 @@ class Tools:
 
         latex_code = "".join(chunks).strip()
 
+        # await __event_emitter__(
+        #     {
+        #         "type": "message",
+        #         "data": {"content": latex_code},
+        #     }
+        # )
+
         await __event_emitter__(
             {
                 "type": "message",
@@ -323,6 +322,13 @@ class Tools:
                 },
             }
         )
+
+        # await __event_emitter__(
+        #     {
+        #         "type": "message",
+        #         "data": {"content": markdown_tagged_text},
+        #     }
+        # )
 
         await __event_emitter__(
             {
