@@ -2,8 +2,8 @@
 title: Audio Transcriber
 author: Sergei Vyaznikov
 description: Переводит аудиофайл в текст с разбиением на спикеров. Ключевые слова: транскрибация, распознавание речи, аудиофайлы
-version: 0.2
-requirements: pyannote.audio==3.4.0, torch, torchvision, torchaudio, transformers, faster_whisper
+version: 0.3
+requirements: pyannote.audio==3.4.0, torch==2.8.0, torchaudio==2.8.0
 """
 
 import os
@@ -120,11 +120,10 @@ async def get_file_content(auth_data: str, file_id: str, valves: dict) -> BytesI
 
 def get_faster_whisper_model(valves: dict) -> WhisperModel:
     whisper_model_index = os.environ.get("WHISPER_MODEL", "base")
-    device_name = valves.DEVICE
     faster_whisper_model = WhisperModel(
         whisper_model_index,
         download_root="/app/backend/data/cache/whisper/models",
-        device=device_name,
+        device=valves.DEVICE,
     )
     return faster_whisper_model
 
@@ -219,7 +218,7 @@ class Tools:
             "pyannote/speaker-diarization-3.1",
             # use_auth_token=hf_token
         )
-        pyannote_pipeline.to(self.valves.DEVICE)
+        pyannote_pipeline.to(torch.device(self.valves.DEVICE))
 
         await __event_emitter__(
             {
@@ -272,11 +271,13 @@ class Tools:
             merged_segments
         ):  # diarization_result.itertracks(yield_label=True):
 
+            speaker_ru = speaker.replace("SPEAKER_", "Спикер ")
+
             await __event_emitter__(
                 {
                     "type": "status",
                     "data": {
-                        "description": f"Распознавание речи... ({idx+1}/{len(merged_segments)})",
+                        "description": f"Распознавание речи... ({100 * ((idx + 1) / len(merged_segments)):.2f}%)",
                         "done": False,
                         "hidden": False,
                     },
@@ -301,7 +302,7 @@ class Tools:
                     {
                         "type": "message",  # or simply "message"
                         "data": {
-                            "content": f"\n\n**{speaker}**: {recognized_text}\n\n"
+                            "content": f"\n\n**{speaker_ru}**: {recognized_text}\n\n"
                         },
                     }
                 )
@@ -310,7 +311,7 @@ class Tools:
                     {
                         "type": "message",  # or simply "message"
                         "data": {
-                            "content": f"\n\n**{speaker}**: Текст распознан с ошибкой: {e}\n\n"
+                            "content": f"\n\n**{speaker_ru}**: Текст распознан с ошибкой: {e}\n\n"
                         },
                     }
                 )
