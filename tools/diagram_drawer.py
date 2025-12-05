@@ -2,19 +2,20 @@
 title: Diagram Drawer
 description: Рисует диаграмму по пользовательскому запросу. Ключевые слова: диаграмма, график, workflow, блок-схема, UML
 author: Sergei Vyaznikov
-version: 0.2
-requirements: requests
+version: 0.3
 """
 
 import zlib
 import base64
 import requests
 
-from langchain_ollama import OllamaLLM
+from langchain_ollama import ChatOllama
+from langchain_openai import ChatOpenAI
 from langchain.prompts import PromptTemplate
 
+from fastapi.responses import HTMLResponse
 from pydantic import Field, BaseModel
-from typing import Optional, Callable, Awaitable, Any
+from typing import Optional, Callable, Awaitable, Any, Literal
 
 
 def encode_plantuml(text):
@@ -38,19 +39,25 @@ def encode_plantuml(text):
 
 
 def get_plantuml_image(
-    uml: str, valves: dict, plantuml_url: str = "http://plantuml-server:8080"
+    uml: str,
+    valves: dict,
+    plantuml_url: str = "http://plantuml-server:8080",
+    data_type="png",
 ) -> str:
     try:
         encoded_uml = encode_plantuml(uml)
-        image_url = f"{valves.PLANTUML_URL}/plantuml/png/{encoded_uml}"
+        image_url = f"{valves.PLANTUML_URL}/plantuml/{data_type}/{encoded_uml}"
         response = requests.get(image_url, timeout=10)
         response.raise_for_status()
+        if data_type == "png":
+            if "image/png" not in response.headers.get("Content-Type", ""):
+                raise ValueError("Response is not a PNG image")
 
-        if "image/png" not in response.headers.get("Content-Type", ""):
-            raise ValueError("Response is not a PNG image")
-
-        image_base64 = base64.b64encode(response.content).decode("utf-8")
-        return image_base64
+            image_base64 = base64.b64encode(response.content).decode("utf-8")
+            return image_base64
+        elif data_type == "svg":
+            svg_content = response.text
+            return svg_content
 
     except requests.RequestException as e:
         raise requests.RequestException(
@@ -64,14 +71,31 @@ class Tools:
 
     class Valves(BaseModel):
 
+        DEBUG_MODE: bool = Field(default=False, description="Режим отладки")
+
         OLLAMA_BASE_URL: str = Field(
             default="http://localhost:11434",
             description="Домен для доступа к Ollama (указывается изнутри контейнера)",
         )
 
-        OLLAMA_MODEL_NAME: str = Field(
+        OPEN_AI_BASE_URL: str = Field(
+            default="http://localhost:8080/v1",
+            description="Домен для доступа к OpenAI-совместимому API из контейнера (http://host:port/v1)",
+        )
+
+        LLM_BACKEND: Literal["ollama", "OpenAI"] = Field(
+            default="ollama",
+            description="Бэкэнд для инференса языковых моделей",
+        )
+
+        RETURN_FORMAT: Literal["png", "svg"] = Field(
+            default="svg",
+            description="Формат возвращаемой диаграммы",
+        )
+
+        MODEL_NAME: str = Field(
             default="qwen3:14b",
-            description="Название модели для генерации диаграмм",
+            description="Название модели для генерации документов",
         )
 
         PLANTUML_URL: str = Field(
@@ -111,20 +135,20 @@ class Tools:
         :return: Дальнейшие инструкции
         :rtype: str
         """
+        try:
+            await __event_emitter__(
+                {
+                    "type": "status",
+                    "data": {
+                        "description": "Генерирую диаграмму...",
+                        "done": False,
+                        "hidden": False,
+                    },
+                }
+            )
 
-        await __event_emitter__(
-            {
-                "type": "status",
-                "data": {
-                    "description": "Генерирую диаграмму...",
-                    "done": False,
-                    "hidden": False,
-                },
-            }
-        )
-
-        context = str(list(filter(lambda x: x["role"] == "user", __messages__)))
-        generate_uml_prompt_template = """/no_think
+            context = str(list(__messages__[-10:]))
+            generate_uml_prompt_template = """/no_think
 Ты — составитель UML-диаграмм. Твоя задача — составлять UML-диаграммы на основе запроса пользователя.
 
 Правила формирования ответа:
@@ -138,98 +162,130 @@ class Tools:
 
 Название диаграммы: {title}
 
-Контекст сообщений пользователя:
+Контекст сообщений в чате:
 <context>
 {context}
 </context>
-"""
+    """
 
-        generate_uml_prompt = PromptTemplate.from_template(generate_uml_prompt_template)
-        generate_uml_prompt = generate_uml_prompt.invoke(
-            {"title": title, "context": context}
-        )
+            generate_uml_prompt = PromptTemplate.from_template(
+                generate_uml_prompt_template
+            )
+            generate_uml_prompt = generate_uml_prompt.invoke(
+                {"title": title, "context": context}
+            )
 
-        llm = OllamaLLM(
-            model=self.valves.OLLAMA_MODEL_NAME, base_url=self.valves.OLLAMA_BASE_URL
-        )
-
-        await __event_emitter__(
-            {
-                "type": "message",
-                "data": {
-                    "content": "<details>\n<summary>Исходный код диаграммы</summary>\n```uml\n"
-                },
-            }
-        )
-
-        chunks = []
-        is_thinking = False
-        batch = []
-        batch_size = 20
-
-        for chunk in llm.stream(generate_uml_prompt):
-            if chunk == "<think>":
-                is_thinking = True
-
-            if chunk == "</think>":
-                is_thinking = False
-                continue
-
-            if is_thinking:
-                continue
-
-            batch.append(chunk)
-            chunks.append(chunk)
-            if len(batch) == batch_size:
-                await __event_emitter__(
-                    {
-                        "type": "message",
-                        "data": {"content": "".join(batch).strip()},
-                    }
+            if self.valves.LLM_BACKEND == "ollama":
+                llm = ChatOllama(
+                    model=self.valves.MODEL_NAME, base_url=self.valves.OLLAMA_BASE_URL
                 )
-                batch = []
+            elif self.valves.LLM_BACKEND == "OpenAI":
+                llm = ChatOpenAI(
+                    model=self.valves.MODEL_NAME,
+                    openai_api_base=self.valves.OPEN_AI_BASE_URL,
+                    openai_api_key="not-needed",
+                    temperature=0.2,
+                )
 
-        if batch:
             await __event_emitter__(
                 {
                     "type": "message",
-                    "data": {"content": "".join(batch).strip()},
+                    "data": {
+                        "content": "<details>\n<summary>Исходный код диаграммы</summary>\n```uml\n"
+                    },
                 }
             )
 
-        uml_code = "".join(chunks).strip()
+            chunks = []
+            is_thinking = False
+            batch = []
+            batch_size = 20
 
-        await __event_emitter__(
-            {
-                "type": "message",
-                "data": {"content": "\n```\n</details>"},
-            }
-        )
+            async for chunk in llm.astream(generate_uml_prompt):
+                chunk_text = chunk.content
+                if chunk_text == "<think>":
+                    is_thinking = True
 
-        await __event_emitter__(
-            {
-                "type": "status",
-                "data": {
-                    "description": "Диаграмма сгенерирована!",
-                    "done": True,
-                    "hidden": False,
-                },
-            }
-        )
+                if chunk_text == "</think>":
+                    is_thinking = False
+                    continue
 
-        image_base64 = get_plantuml_image(uml_code, valves=self.valves)
+                if is_thinking:
+                    continue
 
-        formatted_image = f"\n\n![image](data:image/png;base64,{image_base64})\n\n"
+                batch.append(chunk_text)
+                chunks.append(chunk_text)
+                if len(batch) == batch_size:
+                    await __event_emitter__(
+                        {
+                            "type": "message",
+                            "data": {"content": "".join(batch)},
+                        }
+                    )
+                    batch = []
 
-        await __event_emitter__(
-            {
-                "type": "message",  # or simply "message"
-                "data": {"content": formatted_image},
-            }
-        )
+            if batch:
+                await __event_emitter__(
+                    {
+                        "type": "message",
+                        "data": {"content": "".join(batch)},
+                    }
+                )
 
-        response = "Диаграмма была сгенерирована и отправлена пользователю. \
-        Ваша задача заключается в том, чтобы уведомить пользователя о выполнении его запроса. \
-        Сообщите, что посмотреть исходный код диаграммы можно во вкладке 'Сгенерированный UML код'."
+            uml_code = "".join(chunks).strip()
 
-        return response
+            await __event_emitter__(
+                {
+                    "type": "message",
+                    "data": {"content": "\n```\n</details>"},
+                }
+            )
+
+            await __event_emitter__(
+                {
+                    "type": "status",
+                    "data": {
+                        "description": "Диаграмма сгенерирована!",
+                        "done": True,
+                        "hidden": False,
+                    },
+                }
+            )
+
+            uml_content = get_plantuml_image(
+                uml_code, valves=self.valves, data_type=self.valves.RETURN_FORMAT
+            )
+
+            if self.valves.RETURN_FORMAT == "svg":
+                img_content = uml_content
+
+            elif self.valves.RETURN_FORMAT == "png":
+                base64_image = uml_content
+                img_content = f"""<img src="data:image/png;base64,{base64_image}" alt="{title}">"""
+
+            await __event_emitter__(
+                {
+                    "type": "embeds",
+                    "data": {
+                        "embeds": [img_content],
+                    },
+                }
+            )
+
+            response = "Диаграмма была сгенерирована и отправлена пользователю. \
+            Ваша задача заключается в том, чтобы уведомить пользователя о выполнении его запроса. \
+            Сообщите, что посмотреть исходный код диаграммы можно во вкладке 'Исходный код диаграммы'."
+
+            return response
+
+        except Exception as e:
+            await __event_emitter__(
+                {
+                    "type": "status",
+                    "data": {
+                        "description": f"Ошибка при генерации диаграммы: {e}",
+                        "done": True,
+                        "hidden": False,
+                    },
+                }
+            )
