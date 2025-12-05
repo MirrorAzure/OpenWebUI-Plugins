@@ -2,8 +2,7 @@
 title: PDF text recognizer
 author: Sergei Vyaznikov
 description: Распознаёт текст из PDF и возвращает документ с размеченным текстом. Ключевые слова: OCR, распознавание PDF, сканы документов
-version: 0.2
-requirements: ocrmypdf
+version: 0.3
 """
 
 import os
@@ -83,7 +82,7 @@ async def upload_document_to_server(
             timeout=aiohttp.ClientTimeout(total=60)
         ) as session:
             async with session.post(
-                f"{valves.INTERNAL_URL}/api/v1/files/",
+                "http://127.0.0.1:8080/api/v1/files/",
                 headers=headers,
                 data=form,
             ) as resp:
@@ -121,6 +120,9 @@ async def upload_document_to_server(
 class Tools:
 
     class Valves(BaseModel):
+
+        DEBUG_MODE: bool = Field(default=False, description="Режим отладки")
+
         INTERNAL_URL: str = Field(
             default="http://127.0.0.1:8080",
             description="Домен для доступа к OpenWebUI изнутри контейнера",
@@ -148,54 +150,66 @@ class Tools:
         :return: Статус распознавания PDF-файла.
         :rtype: str.
         """
+        try:
+            if not __files__ or len(__files__) <= 0:
+                return "Файлы не были обнаружены. Ваша задача заключается в том, чтобы уведомить пользователя об ошибке и предложить приложить файл к сообщению."
 
-        if not __files__ or len(__files__) <= 0:
-            return "Файлы не были обнаружены. Ваша задача заключается в том, чтобы уведомить пользователя об ошибке и предложить приложить файл к сообщению."
+            file_data = __files__[-1].get("file")
+            file_id = file_data.get("id")
 
-        file_data = __files__[-1].get("file")
-        file_id = file_data.get("id")
+            auth_data = __request__.headers["authorization"]
 
-        auth_data = __request__.headers["authorization"]
-
-        file_bytes = await get_file_content(
-            auth_data=auth_data, file_id=file_id, valves=self.valves
-        )
-
-        unizue_name = datetime.datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
-
-        with tempfile.NamedTemporaryFile(
-            prefix=unizue_name, suffix=".pdf", delete=False
-        ) as temp_file:
-            ocrmypdf.ocr(
-                file_bytes, temp_file.name, language=["rus", "eng"], force_ocr=True
-            )
-            upload_response = await upload_document_to_server(
-                filename=f"{unizue_name}.pdf",
-                file_path=temp_file.name,
-                valves=self.valves,
-                auth_data=auth_data,
+            file_bytes = await get_file_content(
+                auth_data=auth_data, file_id=file_id, valves=self.valves
             )
 
-        document_url = upload_response.get("url")
-        if not document_url:
-            error = upload_response.get("error")
-            raw_response = upload_response.get("raw_response")
-            response = f"""Во время загрузки файла произошла ошибка: {error}. Полный текст: {raw_response}. Ваша задача заключается в том, чтобы сообщить об ошибке пользователю."""
+            unizue_name = datetime.datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
 
-        formatted_url = f"""
+            with tempfile.NamedTemporaryFile(
+                prefix=unizue_name, suffix=".pdf", delete=False
+            ) as temp_file:
+                ocrmypdf.ocr(
+                    file_bytes, temp_file.name, language=["rus", "eng"], force_ocr=True
+                )
+                upload_response = await upload_document_to_server(
+                    filename=f"{unizue_name}.pdf",
+                    file_path=temp_file.name,
+                    valves=self.valves,
+                    auth_data=auth_data,
+                )
+
+            document_url = upload_response.get("url")
+            if not document_url:
+                error = upload_response.get("error")
+                raw_response = upload_response.get("raw_response")
+                response = f"""Во время загрузки файла произошла ошибка: {error}. Полный текст: {raw_response}. Ваша задача заключается в том, чтобы сообщить об ошибке пользователю."""
+
+            formatted_url = f"""
 \n\n
 [Скачать документ]({document_url})
 \n\n
         """
 
-        await __event_emitter__(
-            {
-                "type": "message",
-                "data": {"content": formatted_url},
-            }
-        )
+            await __event_emitter__(
+                {
+                    "type": "message",
+                    "data": {"content": formatted_url},
+                }
+            )
 
-        response = "Распознавание текста для указанного файла было проведено. Размеченный файл был отправлен пользователю. \
-        Ваша задача заключается в том, чтобы уведомить пользователя о выполнении его запроса. \
-        Сообщите, что получить изменённый файл можно по кнопке 'скачать документ'."
-        return response
+            response = "Распознавание текста для указанного файла было проведено. Размеченный файл был отправлен пользователю. \
+            Ваша задача заключается в том, чтобы уведомить пользователя о выполнении его запроса. \
+            Сообщите, что получить изменённый файл можно по кнопке 'скачать документ'."
+            return response
+
+        except Exception as e:
+            await __event_emitter__(
+                {
+                    "type": "status",
+                    "data": {
+                        "description": f"Ошибка при распознавании документа: {e}",
+                        "done": True,
+                        "hidden": False,
+                    },
+                }
+            )
