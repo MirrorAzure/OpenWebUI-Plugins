@@ -2,8 +2,8 @@
 title: Audio Transcriber
 author: Sergei Vyaznikov
 description: Переводит аудиофайл в текст с разбиением на спикеров. Ключевые слова: транскрибация, распознавание речи, аудиофайлы
-version: 0.3
-requirements: pyannote.audio==3.4.0, torch==2.8.0, torchaudio==2.8.0
+version: 0.4
+requirements: pyannote.audio==3.4.0
 """
 
 import os
@@ -137,6 +137,9 @@ def get_user_auth_data(request) -> str:
 class Tools:
 
     class Valves(BaseModel):
+
+        DEBUG_MODE: bool = Field(default=False, description="Режим отладки")
+
         INTERNAL_URL: str = Field(
             default="http://127.0.0.1:8080",
             description="Домен для доступа к OpenWebUI изнутри контейнера",
@@ -177,174 +180,187 @@ class Tools:
         :return: Статус транскрибации аудиофайла.
         :rtype: str.
         """
+        try:
 
-        if not __files__ or len(__files__) <= 0:
-            return "Файлы не были обнаружены. Ваша задача заключается в том, чтобы уведомить пользователя об ошибке и предложить приложить файл к сообщению."
-
-        await __event_emitter__(
-            {
-                "type": "status",
-                "data": {
-                    "description": "Извлечение данных из аудиофайла...",
-                    "done": False,
-                    "hidden": False,
-                },
-            }
-        )
-
-        file_data = __files__[-1].get("file")
-        file_id = file_data.get("id")
-
-        auth_data = __request__.headers["authorization"]
-
-        audio_bytes = await get_file_content(
-            auth_data=auth_data, file_id=file_id, valves=self.valves
-        )
-
-        waveform, sample_rate = get_waveform_from_bytes(audio_bytes)
-
-        await __event_emitter__(
-            {
-                "type": "status",
-                "data": {
-                    "description": "Данные извлечены!",
-                    "done": True,
-                    "hidden": False,
-                },
-            }
-        )
-
-        pyannote_pipeline = PyannotePipeline.from_pretrained(
-            "pyannote/speaker-diarization-3.1",
-            # use_auth_token=hf_token
-        )
-        pyannote_pipeline.to(torch.device(self.valves.DEVICE))
-
-        await __event_emitter__(
-            {
-                "type": "status",
-                "data": {
-                    "description": "Разделение аудио на спикеров...",
-                    "done": False,
-                    "hidden": False,
-                },
-            }
-        )
-
-        diarization_result = pyannote_pipeline(
-            {"waveform": waveform, "sample_rate": sample_rate},
-            # max_speakers=2
-        )
-
-        await __event_emitter__(
-            {
-                "type": "status",
-                "data": {
-                    "description": "Спикеры определены!",
-                    "done": True,
-                    "hidden": False,
-                },
-            }
-        )
-
-        merged_segments = merge_segments_by_speakers(
-            diarization_result, pause_threshold=2.0, duration_threshold=0.0
-        )
-
-        # whisper_pipeline = get_whisper_model()
-        faster_whisper_model = get_faster_whisper_model(valves=self.valves)
-
-        await __event_emitter__(
-            {
-                "type": "message",  # or simply "message"
-                "data": {
-                    "content": f"\n\n<details>\n\n<summary>Результат транскрибации</summary>\n\n"
-                },
-            }
-        )
-
-        for idx, (
-            segment,
-            _,
-            speaker,
-        ) in enumerate(
-            merged_segments
-        ):  # diarization_result.itertracks(yield_label=True):
-
-            speaker_ru = speaker.replace("SPEAKER_", "Спикер ")
+            if not __files__ or len(__files__) <= 0:
+                return "Файлы не были обнаружены. Ваша задача заключается в том, чтобы уведомить пользователя об ошибке и предложить приложить файл к сообщению."
 
             await __event_emitter__(
                 {
                     "type": "status",
                     "data": {
-                        "description": f"Распознавание речи... ({100 * ((idx + 1) / len(merged_segments)):.2f}%)",
+                        "description": "Извлечение данных из аудиофайла...",
                         "done": False,
                         "hidden": False,
                     },
                 }
             )
-            try:
-                audio_segment = get_audio_segment(segment, waveform)
-                segments_generator, transcription_info = (
-                    faster_whisper_model.transcribe(audio_segment.numpy())
-                )
-                recognized_segments = list(segments_generator)
-                # recognized_text = str(recognized_segments[0].__dir__())
-                recognized_text = " ".join(
-                    [fragment.text for fragment in recognized_segments]
-                )
 
-                # recognition_result = whisper_pipeline(audio_segment, return_timestamps=True)
-                # recognized_text = recognition_result  # recognition_result.get("text")
-                # segments_generator, transcription_info  = recognition_result  # recognition_result.get("text")
+            file_data = __files__[-1].get("file")
+            file_id = file_data.get("id")
+
+            auth_data = __request__.headers["authorization"]
+
+            audio_bytes = await get_file_content(
+                auth_data=auth_data, file_id=file_id, valves=self.valves
+            )
+
+            waveform, sample_rate = get_waveform_from_bytes(audio_bytes)
+
+            await __event_emitter__(
+                {
+                    "type": "status",
+                    "data": {
+                        "description": "Данные извлечены!",
+                        "done": True,
+                        "hidden": False,
+                    },
+                }
+            )
+
+            pyannote_pipeline = PyannotePipeline.from_pretrained(
+                "pyannote/speaker-diarization-3.1",
+                # use_auth_token=hf_token
+            )
+            pyannote_pipeline.to(torch.device(self.valves.DEVICE))
+
+            await __event_emitter__(
+                {
+                    "type": "status",
+                    "data": {
+                        "description": "Разделение аудио на спикеров...",
+                        "done": False,
+                        "hidden": False,
+                    },
+                }
+            )
+
+            diarization_result = pyannote_pipeline(
+                {"waveform": waveform, "sample_rate": sample_rate},
+                # max_speakers=2
+            )
+
+            await __event_emitter__(
+                {
+                    "type": "status",
+                    "data": {
+                        "description": "Спикеры определены!",
+                        "done": True,
+                        "hidden": False,
+                    },
+                }
+            )
+
+            merged_segments = merge_segments_by_speakers(
+                diarization_result, pause_threshold=2.0, duration_threshold=0.0
+            )
+
+            # whisper_pipeline = get_whisper_model()
+            faster_whisper_model = get_faster_whisper_model(valves=self.valves)
+
+            await __event_emitter__(
+                {
+                    "type": "message",  # or simply "message"
+                    "data": {
+                        "content": f"\n\n<details>\n\n<summary>Результат транскрибации</summary>\n\n"
+                    },
+                }
+            )
+
+            for idx, (
+                segment,
+                _,
+                speaker,
+            ) in enumerate(
+                merged_segments
+            ):  # diarization_result.itertracks(yield_label=True):
+
+                speaker_ru = speaker.replace("SPEAKER_", "Спикер ")
 
                 await __event_emitter__(
                     {
-                        "type": "message",  # or simply "message"
+                        "type": "status",
                         "data": {
-                            "content": f"\n\n**{speaker_ru}**: {recognized_text}\n\n"
+                            "description": f"Распознавание речи... ({100 * ((idx + 1) / len(merged_segments)):.2f}%)",
+                            "done": False,
+                            "hidden": False,
                         },
                     }
                 )
-            except Exception as e:
-                await __event_emitter__(
-                    {
-                        "type": "message",  # or simply "message"
-                        "data": {
-                            "content": f"\n\n**{speaker_ru}**: Текст распознан с ошибкой: {e}\n\n"
-                        },
-                    }
-                )
+                try:
+                    audio_segment = get_audio_segment(segment, waveform)
+                    segments_generator, transcription_info = (
+                        faster_whisper_model.transcribe(audio_segment.numpy())
+                    )
+                    recognized_segments = list(segments_generator)
+                    # recognized_text = str(recognized_segments[0].__dir__())
+                    recognized_text = " ".join(
+                        [fragment.text for fragment in recognized_segments]
+                    )
 
-        await __event_emitter__(
-            {
-                "type": "message",  # or simply "message"
-                "data": {"content": f"\n\n</details>\n\n"},
-            }
-        )
+                    # recognition_result = whisper_pipeline(audio_segment, return_timestamps=True)
+                    # recognized_text = recognition_result  # recognition_result.get("text")
+                    # segments_generator, transcription_info  = recognition_result  # recognition_result.get("text")
 
-        await __event_emitter__(
-            {
-                "type": "status",
-                "data": {
-                    "description": f"Речевые фрагменты распознаны!",
-                    "done": True,
-                    "hidden": False,
-                },
-            }
-        )
+                    await __event_emitter__(
+                        {
+                            "type": "message",
+                            "data": {
+                                "content": f"\n\n**{speaker_ru}**: {recognized_text}\n\n"
+                            },
+                        }
+                    )
+                except Exception as e:
+                    await __event_emitter__(
+                        {
+                            "type": "message",
+                            "data": {
+                                "content": f"\n\n**{speaker_ru}**: Текст распознан с ошибкой: {e}\n\n"
+                            },
+                        }
+                    )
 
-        await __event_emitter__(
-            {
-                "type": "notification",
-                "data": {
-                    "type": "info",  # "success", "warning", "error"
-                    "content": "Транскрибация успешно завершена!",
-                },
-            }
-        )
+            await __event_emitter__(
+                {
+                    "type": "message",
+                    "data": {"content": f"\n\n</details>\n\n"},
+                }
+            )
 
-        response = "Транскрибация для указанного файла была проведена. Транскрипция была отправлена пользователю. \
-        Ваша задача заключается в том, чтобы уведомить пользователя о выполнении его запроса. \
-        Сообщите, что посмотреть транскрипцию можно во вкладке 'Результат транскрибации'."
-        return response
+            await __event_emitter__(
+                {
+                    "type": "status",
+                    "data": {
+                        "description": f"Речевые фрагменты распознаны!",
+                        "done": True,
+                        "hidden": False,
+                    },
+                }
+            )
+
+            await __event_emitter__(
+                {
+                    "type": "notification",
+                    "data": {
+                        "type": "info",  # "success", "warning", "error"
+                        "content": "Транскрибация успешно завершена!",
+                    },
+                }
+            )
+
+            response = "Транскрибация для указанного файла была проведена. Транскрипция была отправлена пользователю. \
+            Ваша задача заключается в том, чтобы уведомить пользователя о выполнении его запроса. \
+            Сообщите, что посмотреть транскрипцию можно во вкладке 'Результат транскрибации'."
+            return response
+
+        except Exception as e:
+            await __event_emitter__(
+                {
+                    "type": "status",
+                    "data": {
+                        "description": f"Ошибка при транскрибации: {e}",
+                        "done": True,
+                        "hidden": False,
+                    },
+                }
+            )
