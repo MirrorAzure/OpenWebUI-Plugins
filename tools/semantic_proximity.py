@@ -2,8 +2,7 @@
 title: Семантическая близость
 description: Сопоставляет две таблицы (excel-файла) и возвращает результат сопоставления. Ключевые слова: сопоставление таблиц, спосоставление excel-файлов
 author: Sergei Vyaznikov
-version: 0.4
-requirements: fastapi, aiohttp, pydantic, xlsxwriter, chromadb, pandas, sentence_transformers
+version: 0.5
 """
 
 import os
@@ -176,6 +175,8 @@ def get_proximity_df(
         second_df, on="second_df_index", lsuffix="_x", rsuffix="_y"
     )
     merged_df["Семантическая близость"] = similarities
+
+    merged_df = merged_df.drop("second_df_index", axis=1)
 
     # Сортируем по семантической близости
     sorted_df = merged_df.sort_values(by="Семантическая близость", ascending=False)
@@ -433,6 +434,8 @@ class Tools:
 
     class Valves(BaseModel):
 
+        DEBUG_MODE: bool = Field(default=False, description="Режим отладки")
+
         PUBLIC_DOWNLOAD_DOMAIN: str = Field(
             default="http://localhost:3000",
             description="Домен для доступа к OpenWebUI (без символа `/` в конце)",
@@ -469,117 +472,42 @@ class Tools:
         :type second_column: str
         :return: Дальнейшие указания
         """
+        try:
+            if not __files__:
+                return "Файлы не найдены. Ваша задача заключается в том, чтобы уведомить пользователя об ошибке."
 
-        if not __files__:
-            return "Файлы не найдены. Ваша задача заключается в том, чтобы уведомить пользователя об ошибке."
+            if len(__files__) < 2:
+                return "Для сопоставления требуется два файла. Ваша задача заключается в том, чтобы уведомить пользователя об ошибке."
 
-        if len(__files__) < 2:
-            return "Для сопоставления требуется два файла. Ваша задача заключается в том, чтобы уведомить пользователя об ошибке."
+            auth_data = get_user_auth_data(__request__)
 
-        auth_data = get_user_auth_data(__request__)
+            first_file = __files__[-2].get("file")
+            second_file = __files__[-1].get("file")
 
-        first_file = __files__[-2].get("file")
-        second_file = __files__[-1].get("file")
+            await __event_emitter__(
+                {
+                    "type": "status",
+                    "data": {
+                        "description": "Получение таблиц из файлов...",
+                        "done": False,
+                        "hidden": False,
+                    },
+                }
+            )
 
-        await __event_emitter__(
-            {
-                "type": "status",
-                "data": {
-                    "description": "Получение таблиц из файлов...",
-                    "done": False,
-                    "hidden": False,
-                },
-            }
-        )
+            first_df = await make_df_from_excel_file(
+                auth_data=auth_data, file_data=first_file, valves=self.valves
+            )
 
-        first_df = await make_df_from_excel_file(
-            auth_data=auth_data, file_data=first_file, valves=self.valves
-        )
-
-        second_df = await make_df_from_excel_file(
-            auth_data=auth_data, file_data=second_file, valves=self.valves
-        )
-
-        await __event_emitter__(
-            {
-                "type": "status",
-                "data": {
-                    "description": "Таблицы из файлов получены!",
-                    "done": True,
-                    "hidden": False,
-                },
-            }
-        )
-
-        await __event_emitter__(
-            {
-                "type": "status",
-                "data": {
-                    "description": "Формирование смежной таблицы...",
-                    "done": False,
-                    "hidden": False,
-                },
-            }
-        )
-        proximity_df = get_proximity_df(
-            first_df=first_df,
-            second_df=second_df,
-            first_column=first_column,
-            second_column=second_column,
-            valves=self.valves,
-        )
-
-        await __event_emitter__(
-            {
-                "type": "status",
-                "data": {
-                    "description": "Смежная таблица сформирована!",
-                    "done": True,
-                    "hidden": False,
-                },
-            }
-        )
-
-        # Обрабатываем возможные коллизии в именах
-        first_column = (
-            first_column
-            if first_column in proximity_df.columns
-            else f"{first_column}_x"
-        )
-        second_column = (
-            second_column
-            if second_column in proximity_df.columns
-            else f"{second_column}_y"
-        )
-
-        current_time = datetime.now().strftime("%Y-%m-%d-%H-%M-%S")
-        unique_name = f"Сопоставление_таблиц_{current_time}.xlsx"
-
-        await __event_emitter__(
-            {
-                "type": "status",
-                "data": {
-                    "description": "Формирование результирующего excel-файла...",
-                    "done": False,
-                    "hidden": False,
-                },
-            }
-        )
-
-        with tempfile.TemporaryDirectory() as temp_dir:
-            temp_file_path = os.path.join(temp_dir, unique_name)
-            custom_excel_save(
-                df=proximity_df,
-                excel_file=temp_file_path,
-                first_column=first_column,
-                second_column=second_column,
+            second_df = await make_df_from_excel_file(
+                auth_data=auth_data, file_data=second_file, valves=self.valves
             )
 
             await __event_emitter__(
                 {
                     "type": "status",
                     "data": {
-                        "description": "Результирующий файл сформирован!",
+                        "description": "Таблицы из файлов получены!",
                         "done": True,
                         "hidden": False,
                     },
@@ -590,48 +518,135 @@ class Tools:
                 {
                     "type": "status",
                     "data": {
-                        "description": "Формирование ссылки на скачивание...",
+                        "description": "Формирование смежной таблицы...",
                         "done": False,
                         "hidden": False,
                     },
                 }
             )
-            url_response = await upload_document_to_server(
-                filename=unique_name,
-                file_path=temp_file_path,
+            proximity_df = get_proximity_df(
+                first_df=first_df,
+                second_df=second_df,
+                first_column=first_column,
+                second_column=second_column,
                 valves=self.valves,
-                auth_data=auth_data,
             )
-            file_url = url_response.get("url")
 
-        if not file_url:
-            return "Не удалось загрузить файл на сервер. Ваша задача заключается в том, чтобы уведомить пользователя об ошибке."
+            await __event_emitter__(
+                {
+                    "type": "status",
+                    "data": {
+                        "description": "Смежная таблица сформирована!",
+                        "done": True,
+                        "hidden": False,
+                    },
+                }
+            )
 
-        formatted_url = f"""
+            # Обрабатываем возможные коллизии в именах
+            first_column = (
+                first_column
+                if first_column in proximity_df.columns
+                else f"{first_column}_x"
+            )
+            second_column = (
+                second_column
+                if second_column in proximity_df.columns
+                else f"{second_column}_y"
+            )
+
+            current_time = datetime.now().strftime("%Y-%m-%d-%H-%M-%S")
+            unique_name = f"Сопоставление_таблиц_{current_time}.xlsx"
+
+            await __event_emitter__(
+                {
+                    "type": "status",
+                    "data": {
+                        "description": "Формирование результирующего excel-файла...",
+                        "done": False,
+                        "hidden": False,
+                    },
+                }
+            )
+
+            with tempfile.TemporaryDirectory() as temp_dir:
+                temp_file_path = os.path.join(temp_dir, unique_name)
+                custom_excel_save(
+                    df=proximity_df,
+                    excel_file=temp_file_path,
+                    first_column=first_column,
+                    second_column=second_column,
+                )
+
+                await __event_emitter__(
+                    {
+                        "type": "status",
+                        "data": {
+                            "description": "Результирующий файл сформирован!",
+                            "done": True,
+                            "hidden": False,
+                        },
+                    }
+                )
+
+                await __event_emitter__(
+                    {
+                        "type": "status",
+                        "data": {
+                            "description": "Формирование ссылки на скачивание...",
+                            "done": False,
+                            "hidden": False,
+                        },
+                    }
+                )
+                url_response = await upload_document_to_server(
+                    filename=unique_name,
+                    file_path=temp_file_path,
+                    valves=self.valves,
+                    auth_data=auth_data,
+                )
+                file_url = url_response.get("url")
+
+            if not file_url:
+                return "Не удалось загрузить файл на сервер. Ваша задача заключается в том, чтобы уведомить пользователя об ошибке."
+
+            formatted_url = f"""
 \n\n
 [Скачать файл]({file_url})
 \n\n
-        """
+            """
 
-        await __event_emitter__(
-            {
-                "type": "message",
-                "data": {"content": formatted_url},
-            }
-        )
+            await __event_emitter__(
+                {
+                    "type": "message",
+                    "data": {"content": formatted_url},
+                }
+            )
 
-        await __event_emitter__(
-            {
-                "type": "status",
-                "data": {
-                    "description": "Файл успешно отправлен!",
-                    "done": True,
-                    "hidden": False,
-                },
-            }
-        )
+            await __event_emitter__(
+                {
+                    "type": "status",
+                    "data": {
+                        "description": "Файл успешно отправлен!",
+                        "done": True,
+                        "hidden": False,
+                    },
+                }
+            )
 
-        response = "Сопоставление было проведено и отправлено пользователю. \
-        Ваша задача заключается в том, чтобы уведомить пользователя о выполнении его запроса. \
-        Сообщите, что скачать сопоставленный файл можно по кнопке 'Скачать файл'"
-        return response
+            response = "Сопоставление было проведено и отправлено пользователю. \
+            Ваша задача заключается в том, чтобы уведомить пользователя о выполнении его запроса. \
+            Сообщите, что скачать сопоставленный файл можно по кнопке 'Скачать файл'"
+            return response
+
+        except Exception as e:
+            await __event_emitter__(
+                {
+                    "type": "status",
+                    "data": {
+                        "description": f"Ошибка при сопоставлении таблиц: {e}",
+                        "done": True,
+                        "hidden": False,
+                    },
+                }
+            )
