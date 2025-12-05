@@ -2,21 +2,23 @@
 title: Document Writter
 description: Пишет документ по пользовательскому запросу. Ключевые слова: статья, документ, приказ, распоряжение, пояснительная записка, акт
 author: Sergei Vyaznikov
-version: 0.7
+version: 0.8
 """
 
 import os
 import re
 import aiohttp
 import tempfile
+import subprocess
 
 from pydantic import Field, BaseModel
-from typing import Optional, Callable, Awaitable, Any
+from typing import Optional, Callable, Awaitable, Any, Literal
 from datetime import datetime
 from fastapi import HTTPException
-from langchain_ollama import OllamaLLM
+
+from langchain_ollama import ChatOllama
+from langchain_openai import ChatOpenAI
 from langchain.prompts import PromptTemplate
-import subprocess
 
 
 def convert_latex_to_docx(latex_code: str) -> str:
@@ -134,12 +136,24 @@ class Tools:
 
     class Valves(BaseModel):
 
+        DEBUG_MODE: bool = Field(default=False, description="Режим отладки")
+
         OLLAMA_BASE_URL: str = Field(
             default="http://localhost:11434",
             description="Домен для доступа к Ollama (указывается изнутри контейнера)",
         )
 
-        OLLAMA_MODEL_NAME: str = Field(
+        OPEN_AI_BASE_URL: str = Field(
+            default="http://localhost:8080/v1",
+            description="Домен для доступа к OpenAI-совместимому API из контейнера (http://host:port/v1)",
+        )
+
+        LLM_BACKEND: Literal["ollama", "OpenAI"] = Field(
+            default="ollama",
+            description="Бэкэнд для инференса языковых моделей",
+        )
+
+        MODEL_NAME: str = Field(
             default="qwen3:14b",
             description="Название модели для генерации документов",
         )
@@ -193,21 +207,21 @@ class Tools:
         :return: Статус написания документа.
         :rtype: str.
         """
+        try:
+            await __event_emitter__(
+                {
+                    "type": "status",
+                    "data": {
+                        "description": "Генерирую документ...",
+                        "done": False,
+                        "hidden": False,
+                    },
+                }
+            )
 
-        await __event_emitter__(
-            {
-                "type": "status",
-                "data": {
-                    "description": "Генерирую документ...",
-                    "done": False,
-                    "hidden": False,
-                },
-            }
-        )
+            context = str(list(__messages__[-10:]))
 
-        context = str(list(filter(lambda x: x["role"] == "user", __messages__)))
-
-        prompt_template = """/no_think
+            prompt_template = """/no_think
 Ты — технический писатель. Твоя задача — составлять документы и статьи на основе запроса пользователя.
 
 Правила формирования ответа:
@@ -243,170 +257,191 @@ class Tools:
 <context>
 {context}
 </context>
-            """
+                """
 
-        prompt = PromptTemplate.from_template(prompt_template)
-        prompt = prompt.invoke({"title": title, "context": context})
+            prompt = PromptTemplate.from_template(prompt_template)
+            prompt = prompt.invoke({"title": title, "context": context})
 
-        llm = OllamaLLM(
-            model=self.valves.OLLAMA_MODEL_NAME, base_url=self.valves.OLLAMA_BASE_URL
-        )
-
-        await __event_emitter__(
-            {
-                "type": "message",
-                "data": {
-                    "content": "<details>\n<summary>Исходный код документа</summary>\n```latex\n"
-                },
-            }
-        )
-
-        chunks = []
-        is_thinking = False
-        batch = []
-        batch_size = 20
-
-        for chunk in llm.stream(prompt):
-            if chunk == "<think>":
-                is_thinking = True
-
-            if chunk == "</think>":
-                is_thinking = False
-                continue
-
-            if is_thinking:
-                continue
-
-            batch.append(chunk)
-            chunks.append(chunk)
-            if len(batch) == batch_size:
-                await __event_emitter__(
-                    {
-                        "type": "message",
-                        "data": {"content": "".join(batch).strip()},
-                    }
+            if self.valves.LLM_BACKEND == "ollama":
+                llm = ChatOllama(
+                    model=self.valves.MODEL_NAME, base_url=self.valves.OLLAMA_BASE_URL
                 )
-                batch = []
+            elif self.valves.LLM_BACKEND == "llama.cpp":
+                llm = ChatOpenAI(
+                    model=self.valves.MODEL_NAME,
+                    openai_api_base=self.valves.OPEN_AI_BASE_URL,
+                    openai_api_key="not-needed",
+                    temperature=0.2,
+                )
 
-        if batch:
             await __event_emitter__(
                 {
                     "type": "message",
-                    "data": {"content": "".join(batch).strip()},
+                    "data": {
+                        "content": "<details>\n<summary>Исходный код документа</summary>\n```latex\n"
+                    },
                 }
             )
 
-        latex_code = "".join(chunks).strip()
+            chunks = []
+            is_thinking = False
+            batch = []
+            batch_size = 20
 
-        # await __event_emitter__(
-        #     {
-        #         "type": "message",
-        #         "data": {"content": latex_code},
-        #     }
-        # )
+            async for chunk in llm.astream(prompt):
+                chunk_text = chunk.content
+                if chunk_text == "<think>":
+                    is_thinking = True
 
-        await __event_emitter__(
-            {
-                "type": "message",
-                "data": {"content": "\n```\n</details>"},
-            }
-        )
+                if chunk_text == "</think>":
+                    is_thinking = False
+                    continue
 
-        await __event_emitter__(
-            {
-                "type": "status",
-                "data": {
-                    "description": "Документ сгенерирован!",
-                    "done": True,
-                    "hidden": False,
-                },
-            }
-        )
+                if is_thinking:
+                    continue
 
-        # await __event_emitter__(
-        #     {
-        #         "type": "message",
-        #         "data": {"content": markdown_tagged_text},
-        #     }
-        # )
+                batch.append(chunk_text)
+                chunks.append(chunk_text)
+                if len(batch) == batch_size:
+                    await __event_emitter__(
+                        {
+                            "type": "message",
+                            "data": {"content": "".join(batch)},
+                        }
+                    )
+                    batch = []
 
-        await __event_emitter__(
-            {
-                "type": "status",
-                "data": {
-                    "description": "Отправляю документ пользователю...",
-                    "done": False,
-                    "hidden": False,
-                },
-            }
-        )
+            if batch:
+                await __event_emitter__(
+                    {
+                        "type": "message",
+                        "data": {"content": "".join(batch)},
+                    }
+                )
 
-        docx_file_path = convert_latex_to_docx(latex_code)
+            latex_code = "".join(chunks).strip()
 
-        # model_name = __model__.get("id")
-        # current_time = datetime.now().strftime("%Y-%m-%d-%H-%M-%S")
-        # unique_name = f"Document_{model_name}_{current_time}.docx"
+            # await __event_emitter__(
+            #     {
+            #         "type": "message",
+            #         "data": {"content": latex_code},
+            #     }
+            # )
 
-        # Получаем данные авторизации из запроса пользователя
-        # Нужно, чтобы пользователь имел доступ к сгенерированному файлу
-        auth_data = __request__.headers["authorization"]
+            await __event_emitter__(
+                {
+                    "type": "message",
+                    "data": {"content": "\n```\n</details>"},
+                }
+            )
 
-        # Обрезаем название файла до заданного максимального
-        # Иначе OpenWebUI может выдавать ошибку 400 на длинных названиях
-        upload_response = await upload_document_to_server(
-            filename=f"{title[:self.valves.MAX_FILENAME_LEN]}.docx",
-            file_path=docx_file_path,
-            valves=self.valves,
-            auth_data=auth_data,
-        )
-
-        # Удаляем .docx-файл после загрузки на сервер
-        os.remove(docx_file_path)
-
-        error = upload_response.get("error")
-
-        if error:
-            raw_response = upload_response.get("raw_response")
-            response = f"Во время генерации документа произошла ошибка: {error}. Ваша задача заключается в том, чтобы уведомить пользователя об ошибке."
             await __event_emitter__(
                 {
                     "type": "status",
                     "data": {
-                        "description": f"Ошибка при генерации документа: {raw_response}",
+                        "description": "Документ сгенерирован!",
                         "done": True,
                         "hidden": False,
                     },
                 }
             )
-            return response
 
-        document_url = upload_response.get("url")
+            # await __event_emitter__(
+            #     {
+            #         "type": "message",
+            #         "data": {"content": markdown_tagged_text},
+            #     }
+            # )
 
-        # В идеале использовать html-теги <a> для формирования ссылки, но по какой-то причине их не поддерживает OpenWebUI
-        formatted_url = f"""
+            await __event_emitter__(
+                {
+                    "type": "status",
+                    "data": {
+                        "description": "Отправляю документ пользователю...",
+                        "done": False,
+                        "hidden": False,
+                    },
+                }
+            )
+
+            docx_file_path = convert_latex_to_docx(latex_code)
+
+            # model_name = __model__.get("id")
+            # current_time = datetime.now().strftime("%Y-%m-%d-%H-%M-%S")
+            # unique_name = f"Document_{model_name}_{current_time}.docx"
+
+            # Получаем данные авторизации из запроса пользователя
+            # Нужно, чтобы пользователь имел доступ к сгенерированному файлу
+            auth_data = __request__.headers["authorization"]
+
+            # Обрезаем название файла до заданного максимального
+            # Иначе OpenWebUI может выдавать ошибку 400 на длинных названиях
+            safe_title = re.sub(r'[<>:"/\\|?*:]', "", title)
+            upload_response = await upload_document_to_server(
+                filename=f"{safe_title[:self.valves.MAX_FILENAME_LEN]}.docx",
+                file_path=docx_file_path,
+                valves=self.valves,
+                auth_data=auth_data,
+            )
+
+            # Удаляем .docx-файл после загрузки на сервер
+            os.remove(docx_file_path)
+
+            error = upload_response.get("error")
+
+            if error:
+                raw_response = upload_response.get("raw_response")
+                response = f"Во время генерации документа произошла ошибка: {error}. Ваша задача заключается в том, чтобы уведомить пользователя об ошибке."
+                await __event_emitter__(
+                    {
+                        "type": "status",
+                        "data": {
+                            "description": f"Ошибка при генерации документа: {raw_response}",
+                            "done": True,
+                            "hidden": False,
+                        },
+                    }
+                )
+                return response
+
+            document_url = upload_response.get("url")
+
+            # В идеале использовать html-теги <a> для формирования ссылки, но по какой-то причине их не поддерживает OpenWebUI
+            formatted_url = f"""
 \n\n
 [Скачать документ]({document_url})
 \n\n
-        """
+            """
 
-        await __event_emitter__(
-            {
-                "type": "message",
-                "data": {"content": formatted_url},
-            }
-        )
+            await __event_emitter__(
+                {
+                    "type": "message",
+                    "data": {"content": formatted_url},
+                }
+            )
 
-        await __event_emitter__(
-            {
-                "type": "status",
-                "data": {
-                    "description": "Документ отправлен!",
-                    "done": True,
-                    "hidden": False,
-                },
-            }
-        )
-        response = "Документ был написан и отправлен пользователю. \
-        Ваша задача заключается в том, чтобы уведомить пользователя о выполнении его запроса. \
-        Сообщите, что скачать его можно по кнопке 'Скачать документ'"
-        return response
+            await __event_emitter__(
+                {
+                    "type": "status",
+                    "data": {
+                        "description": "Документ отправлен!",
+                        "done": True,
+                        "hidden": False,
+                    },
+                }
+            )
+            response = "Документ был написан и отправлен пользователю. \
+            Ваша задача заключается в том, чтобы уведомить пользователя о выполнении его запроса. \
+            Сообщите, что скачать его можно по кнопке 'Скачать документ'"
+            return response
+        except Exception as e:
+            await __event_emitter__(
+                {
+                    "type": "status",
+                    "data": {
+                        "description": f"Ошибка при генерации документа: {e}",
+                        "done": True,
+                        "hidden": False,
+                    },
+                }
+            )
