@@ -2,7 +2,7 @@
 title: Data Analyst
 description: Получает данные из системы ТехЭксперт. Ключевые слова: ТехЭксперт
 author: Sergei Vyaznikov
-version: 0.2
+version: 0.3
 """
 
 import os
@@ -11,6 +11,8 @@ import math
 import json
 import torch
 import aiohttp
+import logging
+import datetime
 
 import chromadb
 from chromadb.utils import embedding_functions
@@ -25,7 +27,8 @@ from sentence_transformers import SentenceTransformer
 from nltk.tokenize import sent_tokenize
 
 CHROMA_DB_MAX_BATCH_SIZE = 5461
-collection_name = "tech-expert-documents"
+
+logger = logging.getLogger(__name__)
 
 
 class EventEmitter:
@@ -94,7 +97,10 @@ async def retrieve_techexpert_document(valves: dict, nd: int, format: str = "mar
                 )
 
 
-def chunk_text(text: str, max_chunk_size: int = 1000):
+def chunk_text(text: str, max_chunk_size: int = 1000, overlap: int = 0):
+    if overlap < 0:
+        raise ValueError("Overlap не может быть отрицательным.")
+
     sentences = sent_tokenize(text)
     chunks = []
     current_chunk = []
@@ -102,14 +108,24 @@ def chunk_text(text: str, max_chunk_size: int = 1000):
 
     for sentence in sentences:
         sentence_length = len(sentence)
-        if current_length + sentence_length <= max_chunk_size:
+        # Если текущий чанк пуст, просто добавляем предложение
+        if not current_chunk:
             current_chunk.append(sentence)
-            current_length += sentence_length
-        else:
-            if current_chunk:
-                chunks.append(" ".join(current_chunk))
-            current_chunk = [sentence]
             current_length = sentence_length
+        else:
+            # Проверяем, помещается ли текущее предложение с учётом overlap
+            if current_length + sentence_length <= max_chunk_size:
+                current_chunk.append(sentence)
+                current_length += sentence_length
+            else:
+                # Если не помещается, сохраняем текущий чанк
+                chunks.append(" ".join(current_chunk))
+                # Создаём новый чанк с перекрытием
+                overlap_text = " ".join(current_chunk[-overlap:]) if overlap > 0 else ""
+                current_chunk = [sentence] + sent_tokenize(overlap_text)
+                current_length = len(" ".join(current_chunk))
+
+    # Добавляем оставшийся чанк
     if current_chunk:
         chunks.append(" ".join(current_chunk))
 
@@ -165,10 +181,16 @@ class Tools:
             default=10, description="Количество документов для поиска"
         )
 
-        CHUNK_SIZE: conint(ge=100, le=2000) = Field(
+        CHUNK_SIZE: conint(ge=500, le=2000) = Field(
             json_schema_extra={"format": "range", "minimum": 100, "maximum": 2000},
             default=1000,
             description="Размер чанков для выбора семантически близких документов",
+        )
+
+        CHUNK_OVERLAP: conint(ge=100, le=2000) = Field(
+            json_schema_extra={"format": "range", "minimum": 100, "maximum": 2000},
+            default=1000,
+            description="Размер наслоения чанков",
         )
 
         TECH_EXPERT_URL: str = Field(
@@ -209,10 +231,9 @@ class Tools:
         __event_emitter__=None,
     ) -> str:
         """
-        Инструмент для получения документов из системы ТехЭксперт.
+        Инструмент для получения документов из системы ТехЭксперт
 
-        Инструмент возвращает список релевантных документов, вместе с ссылками на них.
-        
+        Инструмент возвращает список релевантных документов, вместе с ссылками на них
 
         :param queries: Запрос для поиска документов в системе
         :type queries: list[str]
@@ -220,93 +241,124 @@ class Tools:
         :return: Данные из системы ТехЭксперт со ссылками на документы
         :rtype: str
         """
-        emitter = EventEmitter(__event_emitter__)
+        try:
+            emitter = EventEmitter(__event_emitter__)
 
-        await emitter.emit("Получение документов из системы ТехЭксперт...")
+            logger.info(f"Поисковые запросы: {str(queries)}")
 
-        user_query = list(
-            filter(lambda message: message.get("role") == "user", __messages__)
-        )[-1].get("content")
-        processed_nd = set()
-        chunk_data = []
-        for query in queries:
-            response = await search_techexpert_documents(
-                valves=self.valves, query=query, max_docs=self.valves.MAX_DOCS
-            )
-            documents = response.get("documents")
-            for document in documents:
+            await emitter.emit("Получение документов из системы ТехЭксперт...")
 
-                document_nd = document.get("data_nd")
-                if document_nd in processed_nd:
-                    continue
-                processed_nd.add(document_nd)
+            collection_name = f"{uuid.uuid4()}_tech_expert"
 
-                document_text = await retrieve_techexpert_document(
-                    valves=self.valves, nd=document_nd
+            user_query = list(
+                filter(lambda message: message.get("role") == "user", __messages__)
+            )[-1].get("content")
+            processed_nd = set()
+            chunk_data = []
+            for query in queries:
+                response = await search_techexpert_documents(
+                    valves=self.valves, query=query, max_docs=self.valves.MAX_DOCS
                 )
-
-                if not document_text:
-                    continue
-                chunks = chunk_text(
-                    document_text, max_chunk_size=self.valves.CHUNK_SIZE
+                documents = response.get("documents")
+                logger.info(
+                    f"Найденные документы: {str(list(map(lambda x: x.get('data_nd', ''), documents)))}"
                 )
-                for chunk in chunks:
-                    chunk_data.append(
-                        {
-                            "metadata": {
-                                "document_name": document.get("document_name"),
-                                "link": document.get("link"),
-                            },
-                            "content": chunk,
-                        }
+                for document in documents:
+
+                    document_nd = document.get("data_nd")
+                    if document_nd in processed_nd:
+                        continue
+                    processed_nd.add(document_nd)
+
+                    document_text = await retrieve_techexpert_document(
+                        valves=self.valves, nd=document_nd
                     )
 
-        embedding_model = get_embedding_model(valves=self.valves)
+                    if not document_text:
+                        continue
+                    chunks = chunk_text(
+                        document_text,
+                        max_chunk_size=self.valves.CHUNK_SIZE,
+                        overlap=self.valves.CHUNK_OVERLAP,
+                    )
+                    for chunk in chunks:
+                        chunk_data.append(
+                            {
+                                "metadata": {
+                                    "document_name": document.get("document_name"),
+                                    "link": document.get("link"),
+                                },
+                                "content": chunk,
+                            }
+                        )
 
-        document_collection = create_collection_from_chunks(
-            valves=self.valves,
-            collection_name=collection_name,
-            chunk_data=chunk_data,
-            embedding_model=embedding_model,
-        )
-        # return str(body)
-        query_embedding = embedding_model.encode(user_query)
+            embedding_model = get_embedding_model(valves=self.valves)
 
-        results = document_collection.query(
-            query_embeddings=[query_embedding], n_results=10
-        )
-
-        tool_response = list()
-
-        for document, metadata, distance in zip(
-            results["documents"][0], results["metadatas"][0], results["distances"][0]
-        ):
-            document_name = metadata.get("document_name")
-            link = metadata.get("link")
-
-            await __event_emitter__(
-                {
-                    "type": "citation",
-                    "data": {
-                        "document": [document],
-                        "metadata": [{"source": link}],
-                        "source": {"name": document_name},
-                    },
-                }
+            document_collection = create_collection_from_chunks(
+                valves=self.valves,
+                collection_name=collection_name,
+                chunk_data=chunk_data,
+                embedding_model=embedding_model,
             )
 
-            response_element = {
-                "document_link": link,
-                "document_name": document_name,
-                "distance": distance,
-                # "content": document,
-            }
-            tool_response.append(response_element)
+            logger.info(f"Коллекция создана: {collection_name}")
+            # return str(body)
+            query_embedding = embedding_model.encode(user_query)
 
-        await emitter.emit(
-            status="complete",
-            description="Данные из системы ТехЭксперт были получены!",
-            done=True,
-        )
+            results = document_collection.query(
+                query_embeddings=[query_embedding], n_results=10
+            )
 
-        return json.dumps(tool_response, ensure_ascii=False)
+            client = chromadb.Client(Settings())
+            client.delete_collection(name=collection_name)
+
+            logger.info(f"Коллекция удалена: {collection_name}")
+
+            tool_response = list()
+
+            logger.info(f"Сформированный ссылки:")
+            for document, metadata, distance in zip(
+                results["documents"][0],
+                results["metadatas"][0],
+                results["distances"][0],
+            ):
+                document_name = metadata.get("document_name")
+                link = metadata.get("link")
+
+                logger.info(f"Источник: {link}")
+                logger.info(f"Название: {document_name}")
+
+                await __event_emitter__(
+                    {
+                        "type": "citation",
+                        "data": {
+                            "document": [document],
+                            "metadata": [
+                                {
+                                    "source": document_name,
+                                    "url": link,
+                                }
+                            ],
+                            "source": {"name": document_name, "url": link},
+                        },
+                    }
+                )
+
+                response_element = {
+                    "document_link": link,
+                    "document_name": document_name,
+                    "distance": distance,
+                    # "content": document,
+                }
+                tool_response.append(response_element)
+
+            await emitter.emit(
+                status="complete",
+                description="Данные из системы ТехЭксперт были получены!",
+                done=True,
+            )
+
+            return json.dumps(tool_response, ensure_ascii=False)
+
+        except Exception as e:
+            await emitter.emit(f"При работе системы возникла ошибка: {e}", done=True)
