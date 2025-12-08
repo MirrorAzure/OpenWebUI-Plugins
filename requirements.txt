@@ -3,6 +3,7 @@ tex2docx
 aiohttp
 pydantic
 langchain
+langchain-openai
 langchain-ollama
 ocrmypdf
 xlsxwriter
