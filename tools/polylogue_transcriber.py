@@ -15,9 +15,19 @@ from typing import Any, Literal, List, Tuple
 from pydantic import BaseModel, Field, field_validator
 from pyannote.core import Segment, Annotation
 
+import pyannote
 from pyannote.audio import Pipeline as PyannotePipeline
 from transformers import pipeline as TransformersPipeline
 from faster_whisper import WhisperModel
+
+
+torch.serialization.add_safe_globals(
+    [
+        pyannote.audio.core.task.Specifications,
+        pyannote.audio.core.task.Problem,
+        pyannote.audio.core.task.Resolution,
+    ]
+)
 
 
 def get_waveform_from_bytes(
