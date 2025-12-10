@@ -2,17 +2,84 @@
 title: PDF text recognizer
 author: Sergei Vyaznikov
 description: Распознаёт текст из PDF и возвращает документ с размеченным текстом. Ключевые слова: OCR, распознавание PDF, сканы документов
-version: 0.3
+version: 0.4
 """
 
 import os
+import asyncio
 import aiohttp
+import logging
 import tempfile
 import datetime
 import ocrmypdf
 from io import BytesIO
-from typing import Any, Literal, List, Tuple
+from typing import Any, Literal, List, Tuple, Callable
 from pydantic import BaseModel, Field, field_validator
+
+
+logger = logging.getLogger(__name__)
+
+
+async def async_ocr(
+    input_file,
+    output_file,
+    language: List[str] = None,
+    force_ocr: bool = False,
+    **kwargs,
+):
+    """
+    Asynchronous wrapper around the synchronous ocrmypdf.ocr function.
+    Runs the OCR process in a thread pool to avoid blocking the event loop.
+
+    :param input_file: Input file path, bytes, or file-like object.
+    :param output_file: Output file path.
+    :param language: List of languages, e.g., ["rus", "eng"].
+    :param force_ocr: Whether to force OCR even if text is present.
+    :param kwargs: Additional arguments for ocrmypdf.ocr.
+    :return: The result of ocrmypdf.ocr (typically None on success).
+    """
+    loop = asyncio.get_running_loop()
+
+    # Define a synchronous callable for the executor
+    def sync_ocr():
+        return ocrmypdf.ocr(
+            input_file, output_file, language=language, force_ocr=force_ocr, **kwargs
+        )
+
+    # Run the sync function in a thread pool
+    return await loop.run_in_executor(None, sync_ocr)
+
+
+class EventEmitter:
+    def __init__(self, event_emitter: Callable[[dict], Any] = None):
+        self.event_emitter = event_emitter
+
+    async def status(
+        self,
+        description: str = "Unknown State",
+        status: str = "in_progress",
+        done: bool = False,
+    ) -> None:
+        if self.event_emitter:
+            await self.event_emitter(
+                {
+                    "type": "status",
+                    "data": {
+                        "status": status,
+                        "description": description,
+                        "done": done,
+                    },
+                }
+            )
+
+    async def message(self, message: str) -> None:
+        if self.event_emitter:
+            await self.event_emitter(
+                {
+                    "type": "message",
+                    "data": {"content": message},
+                }
+            )
 
 
 async def get_file_content(auth_data: str, file_id: str, valves: dict) -> BytesIO:
@@ -151,11 +218,17 @@ class Tools:
         :rtype: str.
         """
         try:
+            emitter = EventEmitter(__event_emitter__)
+
+            await emitter.status("Распознаю PDF-документ...", done=False)
+
             if not __files__ or len(__files__) <= 0:
                 return "Файлы не были обнаружены. Ваша задача заключается в том, чтобы уведомить пользователя об ошибке и предложить приложить файл к сообщению."
 
             file_data = __files__[-1].get("file")
             file_id = file_data.get("id")
+
+            logger.info(f"Информация о загруженном файле: {file_data}")
 
             auth_data = __request__.headers["authorization"]
 
@@ -163,16 +236,19 @@ class Tools:
                 auth_data=auth_data, file_id=file_id, valves=self.valves
             )
 
-            unizue_name = datetime.datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+            unique_name = datetime.datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
 
             with tempfile.NamedTemporaryFile(
-                prefix=unizue_name, suffix=".pdf", delete=False
+                prefix=unique_name, suffix=".pdf", delete=False
             ) as temp_file:
-                ocrmypdf.ocr(
+                await async_ocr(
                     file_bytes, temp_file.name, language=["rus", "eng"], force_ocr=True
                 )
+                # ocrmypdf.ocr(
+                #     file_bytes, temp_file.name, language=["rus", "eng"], force_ocr=True
+                # )
                 upload_response = await upload_document_to_server(
-                    filename=f"{unizue_name}.pdf",
+                    filename=f"{unique_name}.pdf",
                     file_path=temp_file.name,
                     valves=self.valves,
                     auth_data=auth_data,
@@ -183,19 +259,17 @@ class Tools:
                 error = upload_response.get("error")
                 raw_response = upload_response.get("raw_response")
                 response = f"""Во время загрузки файла произошла ошибка: {error}. Полный текст: {raw_response}. Ваша задача заключается в том, чтобы сообщить об ошибке пользователю."""
-
+                await emitter.status(
+                    f"Во время загрузки файла произошла ошибка: {error}."
+                )
+                return response
             formatted_url = f"""
 \n\n
 [Скачать документ]({document_url})
 \n\n
         """
 
-            await __event_emitter__(
-                {
-                    "type": "message",
-                    "data": {"content": formatted_url},
-                }
-            )
+            await emitter.message(formatted_url)
 
             response = "Распознавание текста для указанного файла было проведено. Размеченный файл был отправлен пользователю. \
             Ваша задача заключается в том, чтобы уведомить пользователя о выполнении его запроса. \
@@ -203,13 +277,5 @@ class Tools:
             return response
 
         except Exception as e:
-            await __event_emitter__(
-                {
-                    "type": "status",
-                    "data": {
-                        "description": f"Ошибка при распознавании документа: {e}",
-                        "done": True,
-                        "hidden": False,
-                    },
-                }
-            )
+            await emitter.status(f"Ошибка при распознавании документа: {e}", done=True)
+            return f"Ошибка при распознавании документа: {e}"
