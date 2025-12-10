@@ -2,7 +2,7 @@
 title: Data Analyst
 description: Получает данные из системы ТехЭксперт. Ключевые слова: ТехЭксперт
 author: Sergei Vyaznikov
-version: 0.3
+version: 0.5
 """
 
 import os
@@ -35,7 +35,12 @@ class EventEmitter:
     def __init__(self, event_emitter: Callable[[dict], Any] = None):
         self.event_emitter = event_emitter
 
-    async def emit(self, description="Unknown State", status="in_progress", done=False):
+    async def status(
+        self,
+        description: str = "Unknown State",
+        status: str = "in_progress",
+        done: bool = False,
+    ) -> None:
         if self.event_emitter:
             await self.event_emitter(
                 {
@@ -45,6 +50,15 @@ class EventEmitter:
                         "description": description,
                         "done": done,
                     },
+                }
+            )
+
+    async def message(self, message: str) -> None:
+        if self.event_emitter:
+            await self.event_emitter(
+                {
+                    "type": "message",
+                    "data": {"content": message},
                 }
             )
 
@@ -91,41 +105,90 @@ async def retrieve_techexpert_document(valves: dict, nd: int, format: str = "mar
                 return data
             else:
                 error_content = await response.text()
+                return
                 raise HTTPException(
                     status_code=response.status,
                     detail=f"Запрос вернул ошибку: {error_content}",
                 )
 
 
-def chunk_text(text: str, max_chunk_size: int = 1000, overlap: int = 0):
+def chunk_text(text: str, max_chunk_size: int = 2000, overlap: int = 200) -> List[str]:
+    """
+    Разбивает текст на чанки с перекрытием.
+
+    Args:
+        text: Исходный текст
+        max_chunk_size: Максимальный размер чанка в символах
+        overlap: Размер перекрытия в символах
+
+    Returns:
+        Список чанков
+    """
     if overlap < 0:
         raise ValueError("Overlap не может быть отрицательным.")
 
-    sentences = sent_tokenize(text)
+    if overlap >= max_chunk_size:
+        raise ValueError("Overlap должен быть меньше max_chunk_size.")
+
+    sentences = sent_tokenize(text, language="russian")
     chunks = []
     current_chunk = []
     current_length = 0
 
-    for sentence in sentences:
+    i = 0
+    while i < len(sentences):
+        sentence = sentences[i]
         sentence_length = len(sentence)
-        # Если текущий чанк пуст, просто добавляем предложение
-        if not current_chunk:
-            current_chunk.append(sentence)
-            current_length = sentence_length
-        else:
-            # Проверяем, помещается ли текущее предложение с учётом overlap
-            if current_length + sentence_length <= max_chunk_size:
-                current_chunk.append(sentence)
-                current_length += sentence_length
-            else:
-                # Если не помещается, сохраняем текущий чанк
-                chunks.append(" ".join(current_chunk))
-                # Создаём новый чанк с перекрытием
-                overlap_text = " ".join(current_chunk[-overlap:]) if overlap > 0 else ""
-                current_chunk = [sentence] + sent_tokenize(overlap_text)
-                current_length = len(" ".join(current_chunk))
 
-    # Добавляем оставшийся чанк
+        if sentence_length > max_chunk_size:
+            if current_chunk:
+                chunks.append(" ".join(current_chunk))
+                current_chunk = []
+                current_length = 0
+
+            for j in range(0, len(sentence), max_chunk_size - overlap):
+                part = sentence[j : j + max_chunk_size]
+                chunks.append(part)
+
+            i += 1
+            continue
+
+        add_space = 1 if current_chunk else 0
+
+        if current_length + add_space + sentence_length <= max_chunk_size:
+            if current_chunk:
+                current_length += 1
+            current_length += sentence_length
+            current_chunk.append(sentence)
+            i += 1
+        else:
+            if current_chunk:
+                chunks.append(" ".join(current_chunk))
+
+            if overlap > 0:
+                overlap_sentences = []
+                overlap_chars = 0
+
+                max_allowed_overlap = max_chunk_size - sentence_length - 1
+                limit = min(overlap, max_allowed_overlap)
+
+                for s in reversed(current_chunk):
+                    add_len = len(s)
+                    if overlap_sentences:
+                        add_len += 1
+
+                    if overlap_chars + add_len <= limit:
+                        overlap_sentences.insert(0, s)
+                        overlap_chars += add_len
+                    else:
+                        break
+
+                current_chunk = overlap_sentences
+                current_length = overlap_chars
+            else:
+                current_chunk = []
+                current_length = 0
+
     if current_chunk:
         chunks.append(" ".join(current_chunk))
 
@@ -181,15 +244,19 @@ class Tools:
             default=10, description="Количество документов для поиска"
         )
 
+        MAX_CHUNKS: int = Field(
+            default=10, description="Количество чанков для ранжирования"
+        )
+
         CHUNK_SIZE: conint(ge=500, le=2000) = Field(
-            json_schema_extra={"format": "range", "minimum": 100, "maximum": 2000},
+            json_schema_extra={"format": "range", "minimum": 500, "maximum": 2000},
             default=1000,
             description="Размер чанков для выбора семантически близких документов",
         )
 
-        CHUNK_OVERLAP: conint(ge=100, le=2000) = Field(
-            json_schema_extra={"format": "range", "minimum": 100, "maximum": 2000},
-            default=1000,
+        CHUNK_OVERLAP: conint(ge=0, le=2000) = Field(
+            json_schema_extra={"format": "range", "minimum": 0, "maximum": 2000},
+            default=200,
             description="Размер наслоения чанков",
         )
 
@@ -246,7 +313,9 @@ class Tools:
 
             logger.info(f"Поисковые запросы: {str(queries)}")
 
-            await emitter.emit("Получение документов из системы ТехЭксперт...")
+            await emitter.status(
+                "Получение документов из системы ТехЭксперт...", done=False
+            )
 
             collection_name = f"{uuid.uuid4()}_tech_expert"
 
@@ -256,12 +325,20 @@ class Tools:
             processed_nd = set()
             chunk_data = []
             for query in queries:
+                await emitter.status(
+                    f"Запрос в систему ТехЭксперт: '{query}''...", done=False
+                )
                 response = await search_techexpert_documents(
                     valves=self.valves, query=query, max_docs=self.valves.MAX_DOCS
                 )
                 documents = response.get("documents")
                 logger.info(
                     f"Найденные документы: {str(list(map(lambda x: x.get('data_nd', ''), documents)))}"
+                )
+
+                await emitter.status(
+                    f"Найдено {len(documents)} документов...",
+                    done=False,
                 )
                 for document in documents:
 
@@ -306,7 +383,7 @@ class Tools:
             query_embedding = embedding_model.encode(user_query)
 
             results = document_collection.query(
-                query_embeddings=[query_embedding], n_results=10
+                query_embeddings=[query_embedding], n_results=self.valves.MAX_CHUNKS
             )
 
             client = chromadb.Client(Settings())
@@ -348,11 +425,11 @@ class Tools:
                     "document_link": link,
                     "document_name": document_name,
                     "distance": distance,
-                    # "content": document,
+                    "content": document,
                 }
                 tool_response.append(response_element)
 
-            await emitter.emit(
+            await emitter.status(
                 status="complete",
                 description="Данные из системы ТехЭксперт были получены!",
                 done=True,
@@ -361,4 +438,4 @@ class Tools:
             return json.dumps(tool_response, ensure_ascii=False)
 
         except Exception as e:
-            await emitter.emit(f"При работе системы возникла ошибка: {e}", done=True)
+            await emitter.status(f"При работе системы возникла ошибка: {e}", done=True)
