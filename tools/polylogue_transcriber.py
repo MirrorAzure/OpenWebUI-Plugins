@@ -2,7 +2,7 @@
 title: Audio Transcriber
 author: Sergei Vyaznikov
 description: Переводит аудиофайл в текст с разбиением на спикеров. Ключевые слова: транскрибация, распознавание речи, аудиофайлы
-version: 0.4
+version: 0.5
 requirements: pyannote.audio==3.4.0
 """
 
@@ -10,28 +10,164 @@ import os
 import aiohttp
 import torch
 import torchaudio
+import logging
+import asyncio
 from io import BytesIO
-from typing import Any, Literal, List, Tuple
-from pydantic import BaseModel, Field, field_validator
+from typing import Any, Literal, List, Tuple, Callable
+from pydantic import BaseModel, Field, field_validator, computed_field
+import pyannote
+from collections import defaultdict
 from pyannote.core import Segment, Annotation
 
-import pyannote
 from pyannote.audio import Pipeline as PyannotePipeline
 from transformers import pipeline as TransformersPipeline
 from faster_whisper import WhisperModel
 
+logger = logging.getLogger(__name__)
 
 torch.serialization.add_safe_globals(
     [
         pyannote.audio.core.task.Specifications,
         pyannote.audio.core.task.Problem,
         pyannote.audio.core.task.Resolution,
+        torch.torch_version.TorchVersion,
     ]
 )
 
 
+class SpeakerSegment(BaseModel):
+    speaker: str
+    text: str
+    start: float
+    end: float
+
+    @computed_field
+    @property
+    def ru_speaker(self) -> str:
+        return self.speaker.replace("SPEAKER_", "Спикер ")
+
+
+class EventEmitter:
+    def __init__(self, event_emitter: Callable[[dict], Any] = None):
+        self.event_emitter = event_emitter
+
+    async def status(
+        self,
+        description: str = "Unknown State",
+        status: str = "in_progress",
+        done: bool = False,
+    ) -> None:
+        if self.event_emitter:
+            await self.event_emitter(
+                {
+                    "type": "status",
+                    "data": {
+                        "status": status,
+                        "description": description,
+                        "done": done,
+                    },
+                }
+            )
+
+    async def message(self, message: str) -> None:
+        if self.event_emitter:
+            await self.event_emitter(
+                {
+                    "type": "message",
+                    "data": {"content": message},
+                }
+            )
+
+
+async def async_diarization(pyannote_pipeline, waveform, sample_rate):
+    """
+    Asynchronous wrapper around the synchronous pyannote_pipeline call.
+    Runs the diarization process in a thread pool to avoid blocking the event loop.
+
+    :param pyannote_pipeline: The pyannote pipeline instance.
+    :param waveform: The waveform tensor.
+    :param sample_rate: The sample rate of the audio.
+    :return: The result of pyannote_pipeline.
+    """
+    loop = asyncio.get_running_loop()
+
+    # Define a synchronous callable for the executor
+    def sync_diarization():
+        return pyannote_pipeline({"waveform": waveform, "sample_rate": sample_rate})
+
+    # Run the sync function in a thread pool
+    return await loop.run_in_executor(None, sync_diarization)
+
+
+async def async_transcription(faster_whisper_model, waveform):
+    """
+    Asynchronous wrapper around the synchronous faster_whisper_model.transcribe call.
+    Runs the transcription process in a thread pool to avoid blocking the event loop.
+
+    :param faster_whisper_model: The faster-whisper model instance.
+    :param waveform: The waveform tensor.
+    :return: The result of faster_whisper_model.transcribe (a tuple: transcription_result, transcription_info).
+    """
+    loop = asyncio.get_running_loop()
+
+    # Define a synchronous callable for the executor
+    def sync_transcription():
+        return faster_whisper_model.transcribe(waveform[0].numpy())
+
+    # Run the sync function in a thread pool
+    return await loop.run_in_executor(None, sync_transcription)
+
+
+def match_speakers_to_transcripts(diarization_iterable, transcription_segments):
+    """
+    Matches speakers from pyannote diarization to Whisper transcription segments.
+
+    Args:
+    - diarization_iterable: Iterable of (segment, speaker) where segment has .start and .end (floats in seconds).
+    - transcription_segments: List of Whisper segments with .start, .end, .text.
+
+    Returns:
+    - list[SpeakerSegment]: List of SpeakerSegment objects.
+    """
+    result = []
+    for trans in transcription_segments:
+        trans_start = trans.start
+        trans_end = trans.end
+        speaker_durations = defaultdict(float)
+        for dia_seg, _, speaker in diarization_iterable.itertracks(yield_label=True):
+            overlap_start = max(trans_start, dia_seg.start)
+            overlap_end = min(trans_end, dia_seg.end)
+            if overlap_start < overlap_end:
+                duration = overlap_end - overlap_start
+                speaker_durations[speaker] += duration
+
+        if speaker_durations:
+            # Select the speaker with the maximum overlap duration
+            max_speaker = max(speaker_durations, key=speaker_durations.get)
+            result.append(
+                SpeakerSegment(
+                    speaker=max_speaker,
+                    text=trans.text.strip(),
+                    start=trans_start,
+                    end=trans_end,
+                )
+            )
+        else:
+            # Fallback if no overlap (rare, but possible)
+            result.append(
+                SpeakerSegment(
+                    speaker="Неопределено",
+                    text=trans.text.strip(),
+                    start=trans_start,
+                    end=trans_end,
+                )
+            )
+
+    return result
+
+
 def get_waveform_from_bytes(
-    audio_bytes: BytesIO, sample_rate: int = 22050
+    audio_bytes: BytesIO, sample_rate: int = 16000
 ) -> Tuple[torch.Tensor, int]:
     waveform, original_sample_rate = torchaudio.load(audio_bytes)
 
@@ -48,7 +184,7 @@ def get_waveform_from_bytes(
 
 
 def get_audio_segment(
-    segment: Segment, waveform: torch.Tensor, sample_rate: int = 22050
+    segment: Segment, waveform: torch.Tensor, sample_rate: int = 16000
 ) -> torch.Tensor:
     """Получает фрагмент из аудиопотока"""
     return waveform[0][
@@ -191,20 +327,11 @@ class Tools:
         :rtype: str.
         """
         try:
-
+            emitter = EventEmitter(__event_emitter__)
             if not __files__ or len(__files__) <= 0:
                 return "Файлы не были обнаружены. Ваша задача заключается в том, чтобы уведомить пользователя об ошибке и предложить приложить файл к сообщению."
 
-            await __event_emitter__(
-                {
-                    "type": "status",
-                    "data": {
-                        "description": "Извлечение данных из аудиофайла...",
-                        "done": False,
-                        "hidden": False,
-                    },
-                }
-            )
+            await emitter.status("Извлечение данных из аудиофайла...", done=False)
 
             file_data = __files__[-1].get("file")
             file_id = file_data.get("id")
@@ -217,136 +344,51 @@ class Tools:
 
             waveform, sample_rate = get_waveform_from_bytes(audio_bytes)
 
-            await __event_emitter__(
-                {
-                    "type": "status",
-                    "data": {
-                        "description": "Данные извлечены!",
-                        "done": True,
-                        "hidden": False,
-                    },
-                }
-            )
-
             pyannote_pipeline = PyannotePipeline.from_pretrained(
                 "pyannote/speaker-diarization-3.1",
                 # use_auth_token=hf_token
             )
             pyannote_pipeline.to(torch.device(self.valves.DEVICE))
 
-            await __event_emitter__(
-                {
-                    "type": "status",
-                    "data": {
-                        "description": "Разделение аудио на спикеров...",
-                        "done": False,
-                        "hidden": False,
-                    },
-                }
-            )
-
-            diarization_result = pyannote_pipeline(
-                {"waveform": waveform, "sample_rate": sample_rate},
-                # max_speakers=2
-            )
-
-            await __event_emitter__(
-                {
-                    "type": "status",
-                    "data": {
-                        "description": "Спикеры определены!",
-                        "done": True,
-                        "hidden": False,
-                    },
-                }
-            )
-
-            merged_segments = merge_segments_by_speakers(
-                diarization_result, pause_threshold=2.0, duration_threshold=0.0
-            )
-
             # whisper_pipeline = get_whisper_model()
             faster_whisper_model = get_faster_whisper_model(valves=self.valves)
 
-            await __event_emitter__(
-                {
-                    "type": "message",  # or simply "message"
-                    "data": {
-                        "content": f"\n\n<details>\n\n<summary>Результат транскрибации</summary>\n\n"
-                    },
-                }
+            await emitter.status("Обработка аудио...", done=False)
+
+            # Create tasks for parallel execution
+            diarization_task = asyncio.create_task(
+                async_diarization(pyannote_pipeline, waveform, sample_rate)
+            )
+            transcription_task = asyncio.create_task(
+                async_transcription(faster_whisper_model, waveform)
             )
 
-            for idx, (
-                segment,
-                _,
-                speaker,
-            ) in enumerate(
-                merged_segments
-            ):  # diarization_result.itertracks(yield_label=True):
+            # Await both tasks in parallel using gather
+            results = await asyncio.gather(diarization_task, transcription_task)
 
-                speaker_ru = speaker.replace("SPEAKER_", "Спикер ")
+            # Unpack the results
+            diarization_result = results[0]
+            transcription_result, transcription_info = results[1]
+            transcription_result = list(transcription_result)
 
-                await __event_emitter__(
-                    {
-                        "type": "status",
-                        "data": {
-                            "description": f"Распознавание речи... ({100 * ((idx + 1) / len(merged_segments)):.2f}%)",
-                            "done": False,
-                            "hidden": False,
-                        },
-                    }
-                )
-                try:
-                    audio_segment = get_audio_segment(segment, waveform)
-                    segments_generator, transcription_info = (
-                        faster_whisper_model.transcribe(audio_segment.numpy())
-                    )
-                    recognized_segments = list(segments_generator)
-                    # recognized_text = str(recognized_segments[0].__dir__())
-                    recognized_text = " ".join(
-                        [fragment.text for fragment in recognized_segments]
-                    )
+            await emitter.status("Сопоставление спикеров...", done=False)
 
-                    # recognition_result = whisper_pipeline(audio_segment, return_timestamps=True)
-                    # recognized_text = recognition_result  # recognition_result.get("text")
-                    # segments_generator, transcription_info  = recognition_result  # recognition_result.get("text")
-
-                    await __event_emitter__(
-                        {
-                            "type": "message",
-                            "data": {
-                                "content": f"\n\n**{speaker_ru}**: {recognized_text}\n\n"
-                            },
-                        }
-                    )
-                except Exception as e:
-                    await __event_emitter__(
-                        {
-                            "type": "message",
-                            "data": {
-                                "content": f"\n\n**{speaker_ru}**: Текст распознан с ошибкой: {e}\n\n"
-                            },
-                        }
-                    )
-
-            await __event_emitter__(
-                {
-                    "type": "message",
-                    "data": {"content": f"\n\n</details>\n\n"},
-                }
+            speaker_segments = match_speakers_to_transcripts(
+                diarization_result, transcription_result
             )
 
-            await __event_emitter__(
-                {
-                    "type": "status",
-                    "data": {
-                        "description": f"Речевые фрагменты распознаны!",
-                        "done": True,
-                        "hidden": False,
-                    },
-                }
+            await emitter.message(
+                f"\n<details>\n\n<summary>Результат транскрибации</summary>\n"
             )
+
+            for segment in speaker_segments:
+                speaker = segment.ru_speaker
+                text = segment.text
+                await emitter.message(f"{speaker}: {text}\n")
+
+            await emitter.message(f"\n</details>\n")
+
+            await emitter.status(f"Речевые фрагменты распознаны!", done=True)
 
             await __event_emitter__(
                 {
@@ -364,13 +406,5 @@ class Tools:
             return response
 
         except Exception as e:
-            await __event_emitter__(
-                {
-                    "type": "status",
-                    "data": {
-                        "description": f"Ошибка при транскрибации: {e}",
-                        "done": True,
-                        "hidden": False,
-                    },
-                }
-            )
+            await emitter.status(f"Ошибка при транскрибации: {e}", done=True)
+            return f"Ошибка при транскрибации: {e}"
